@@ -38,6 +38,8 @@ Do not push `node_modules/`, `.deploy/`, `.pytest-tmp/`, `.verification/`, `dist
 ```text
 SUPPORT_COUNTER_ADMIN_PASSWORD=choose-a-demo-admin-password
 SUPPORT_COUNTER_SUPERVISOR_PASSWORD=choose-a-demo-supervisor-password
+PUBLIC_BASE_URL=https://your-render-or-custom-domain
+SUPPORT_COUNTER_CORS_ORIGINS=https://your-render-or-custom-domain
 ```
 
 The login emails are:
@@ -61,8 +63,15 @@ Check:
 ```text
 /health
 /docs
+/openapi.json
+/agent-openapi.json
+/.well-known/agent-card.json
+/agent-door.json
+/llms.txt
 /
 ```
+
+If you add a custom domain later, update `PUBLIC_BASE_URL` and `SUPPORT_COUNTER_CORS_ORIGINS` to that final HTTPS domain, then redeploy or restart the service.
 
 ## 4. Point your Exabytes domain
 

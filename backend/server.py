@@ -5,14 +5,15 @@ import json
 import os
 import secrets
 import sqlite3
+import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Literal
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Response, status
+from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -21,6 +22,23 @@ ROOT = Path(__file__).resolve().parent
 DB_PATH = Path(os.getenv("SUPPORT_COUNTER_DB", ROOT / "agent_support_counter.db"))
 FRONTEND_DIST = Path(os.getenv("FRONTEND_DIST_DIR", ROOT.parent / "dist"))
 SESSION_HOURS = 10
+APP_VERSION = "0.2.0"
+PUBLIC_RATE_LIMIT_WINDOW_SECONDS = int(os.getenv("PUBLIC_RATE_LIMIT_WINDOW_SECONDS", "60"))
+PUBLIC_RATE_LIMIT_MAX_REQUESTS = int(os.getenv("PUBLIC_RATE_LIMIT_MAX_REQUESTS", "45"))
+_public_rate_buckets: dict[str, list[float]] = {}
+
+
+def normalize_base_url(value: str | None) -> str | None:
+    if not value:
+        return None
+    return value.rstrip("/")
+
+
+PUBLIC_BASE_URL = normalize_base_url(os.getenv("PUBLIC_BASE_URL"))
+
+
+def public_base_url(request: Request) -> str:
+    return PUBLIC_BASE_URL or str(request.base_url).rstrip("/")
 
 
 def now() -> str:
@@ -64,6 +82,37 @@ def row_dict(row: sqlite3.Row | None) -> dict[str, Any] | None:
 
 def rows_dict(rows: list[sqlite3.Row]) -> list[dict[str, Any]]:
     return [row_dict(row) or {} for row in rows]
+
+
+def request_ip(request: Request) -> str:
+    forwarded = request.headers.get("x-forwarded-for")
+    if forwarded:
+        return forwarded.split(",", 1)[0].strip()
+    if request.client and request.client.host:
+        return request.client.host
+    return "unknown"
+
+
+def client_hash(request: Request) -> str:
+    return hashlib.sha256(f"public-agent-door:{request_ip(request)}".encode("utf-8")).hexdigest()[:24]
+
+
+def enforce_public_rate_limit(request: Request) -> str:
+    key = client_hash(request)
+    current = time.monotonic()
+    recent = [
+        timestamp
+        for timestamp in _public_rate_buckets.get(key, [])
+        if current - timestamp < PUBLIC_RATE_LIMIT_WINDOW_SECONDS
+    ]
+    if len(recent) >= PUBLIC_RATE_LIMIT_MAX_REQUESTS:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Too many public requests. Please wait and try again.",
+        )
+    recent.append(current)
+    _public_rate_buckets[key] = recent
+    return key
 
 
 def init_db() -> None:
@@ -174,8 +223,8 @@ def seed_users(conn: sqlite3.Connection) -> None:
 
 
 class LoginRequest(BaseModel):
-    email: str
-    password: str
+    email: str = Field(examples=["admin@counter.local"])
+    password: str = Field(examples=["admin123"])
 
 
 class StatusRequest(BaseModel):
@@ -183,22 +232,63 @@ class StatusRequest(BaseModel):
 
 
 class ConsultationCreate(BaseModel):
-    customer_name: str = Field(min_length=2, max_length=120)
-    customer_email: str | None = None
+    customer_name: str = Field(
+        min_length=2,
+        max_length=120,
+        description="Human customer name or the display name supplied by the calling AI tool.",
+        examples=["Agent User"],
+    )
+    customer_email: str | None = Field(default=None, description="Optional customer contact email.")
     language: Literal["en", "ms"] = "en"
-    topic: str = Field(min_length=3, max_length=160)
-    description: str = Field(min_length=8, max_length=4000)
-    source: Literal["public", "agent"] = "public"
+    topic: str = Field(min_length=3, max_length=160, examples=["Login verification failed"])
+    description: str = Field(
+        min_length=8,
+        max_length=4000,
+        description="Initial support issue or structured summary from the external AI tool.",
+        examples=["The user cannot sign in after password reset and needs a human support admin."],
+    )
+    source: Literal["public", "agent"] = Field(
+        default="public",
+        description="Use 'agent' when ChatGPT, Gemini, or another AI tool creates the consultation for a user.",
+    )
+
+    model_config = {
+        "json_schema_extra": {
+            "examples": [
+                {
+                    "customer_name": "Agent User",
+                    "customer_email": "user@example.com",
+                    "language": "en",
+                    "topic": "Login verification failed",
+                    "description": "The user cannot sign in after password reset and needs a human support admin.",
+                    "source": "agent",
+                }
+            ]
+        }
+    }
 
 
 class MessageCreate(BaseModel):
-    content: str = Field(min_length=1, max_length=4000)
-    role: Literal["customer", "agent"] = "customer"
+    content: str = Field(min_length=1, max_length=4000, examples=["The user has confirmed their account email."])
+    role: Literal["customer", "agent"] = Field(
+        default="customer",
+        description="Use 'agent' when an external AI tool is speaking on behalf of the user.",
+    )
     language: Literal["en", "ms"] = "en"
+
+    model_config = {
+        "json_schema_extra": {
+            "examples": [{"content": "The user has confirmed their account email.", "role": "agent", "language": "en"}]
+        }
+    }
 
 
 class HandoffRequest(BaseModel):
-    reason: str = Field(default="AI confidence below support threshold", max_length=500)
+    reason: str = Field(
+        default="AI confidence below support threshold",
+        max_length=500,
+        description="Why the AI tool wants a human support admin to take over.",
+    )
 
 
 class ConsultationPatch(BaseModel):
@@ -373,11 +463,36 @@ def require_supervisor(user: dict[str, Any] = Depends(current_user)) -> dict[str
 def cors_origins() -> list[str]:
     raw = os.getenv("SUPPORT_COUNTER_CORS_ORIGINS")
     if raw:
-        return [origin.strip() for origin in raw.split(",") if origin.strip()]
-    return ["http://127.0.0.1:5173", "http://localhost:5173"]
+        origins = [origin.strip() for origin in raw.split(",") if origin.strip()]
+    else:
+        origins = ["http://127.0.0.1:5173", "http://localhost:5173"]
+    if PUBLIC_BASE_URL and PUBLIC_BASE_URL not in origins:
+        origins.append(PUBLIC_BASE_URL)
+    return origins
 
 
-app = FastAPI(title="WFH Agent Customer Support Counter", version="0.1.0")
+app_config: dict[str, Any] = {
+    "title": "Public Agent Customer Support Door",
+    "version": APP_VERSION,
+    "description": (
+        "A public customer support queue that can be used by humans through the web app "
+        "and by AI tools through REST/OpenAPI. External agents can create a consultation, "
+        "receive a queue number, post messages, check status, and request human handoff."
+    ),
+    "contact": {"name": "Agent Support Counter"},
+    "openapi_tags": [
+        {"name": "Agent Discovery", "description": "Public discovery documents for AI tools and agent networks."},
+        {"name": "Public Consultations", "description": "No-key queue and consultation endpoints for humans and AI tools."},
+        {"name": "Admin Auth", "description": "Login and session endpoints for remote support admins."},
+        {"name": "Admin Queue", "description": "Authenticated queue, assignment, supervisor, and audit endpoints."},
+        {"name": "System", "description": "Health checks."},
+    ],
+}
+if PUBLIC_BASE_URL:
+    app_config["servers"] = [{"url": PUBLIC_BASE_URL, "description": "Configured public HTTPS server"}]
+
+
+app = FastAPI(**app_config)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=cors_origins(),
@@ -390,17 +505,324 @@ if (FRONTEND_DIST / "assets").exists():
     app.mount("/assets", StaticFiles(directory=FRONTEND_DIST / "assets"), name="assets")
 
 
+def agent_card_payload(base_url: str) -> dict[str, Any]:
+    return {
+        "schema_version": "0.3",
+        "protocol": "a2a-discovery-rest-bridge",
+        "name": "Public Agent Customer Support Door",
+        "description": (
+            "A public support counter where AI tools can take a queue number for a user, "
+            "continue the consultation by REST, and request human support handoff."
+        ),
+        "url": base_url,
+        "version": APP_VERSION,
+        "documentationUrl": f"{base_url}/agent-door",
+        "provider": {"organization": "Agent Support Counter", "url": base_url},
+        "authentication": {
+            "required": False,
+            "schemes": ["none"],
+            "note": "Public consultation endpoints require no API key for the MVP. Admin endpoints require login.",
+        },
+        "capabilities": {
+            "streaming": False,
+            "pushNotifications": False,
+            "stateTransitionHistory": True,
+            "humanHandoff": True,
+            "queueNumber": True,
+        },
+        "skills": [
+            {
+                "id": "take_support_number",
+                "name": "Take a support queue number",
+                "description": "Create a consultation for a user and receive a queue number.",
+                "tags": ["customer-support", "queue", "rest"],
+                "inputModes": ["application/json"],
+                "outputModes": ["application/json"],
+                "examples": [
+                    "Create a support ticket for a user who cannot log in.",
+                    "Ask for human support after AI triage is not enough.",
+                ],
+            },
+            {
+                "id": "consult_with_human_support",
+                "name": "Consult with human support",
+                "description": "Post follow-up messages, read queue status, and request handoff to a remote admin.",
+                "tags": ["human-handoff", "support-chat", "status"],
+                "inputModes": ["application/json"],
+                "outputModes": ["application/json"],
+            },
+        ],
+        "extensions": [
+            {"id": "agent-openapi", "name": "Public agent OpenAPI contract", "url": f"{base_url}/agent-openapi.json"},
+            {"id": "agent-door", "name": "Agent workflow guide", "url": f"{base_url}/agent-door.json"},
+            {"id": "llms", "name": "LLM text guide", "url": f"{base_url}/llms.txt"},
+        ],
+    }
+
+
+def agent_door_payload(base_url: str) -> dict[str, Any]:
+    create_body = {
+        "customer_name": "Agent User",
+        "customer_email": "user@example.com",
+        "language": "en",
+        "topic": "Login verification failed",
+        "description": "The user cannot sign in after password reset and needs a human support admin.",
+        "source": "agent",
+    }
+    return {
+        "schema_version": "2026-05-01",
+        "name": "Public Agent Door For Customer Support",
+        "base_url": base_url,
+        "purpose": (
+            "Let humans and AI tools enter the same remote customer support queue. "
+            "The AI tool can create the ticket, keep the user updated, and request human handoff."
+        ),
+        "auth": {
+            "public_consultation_endpoints": "none",
+            "admin_endpoints": "bearer session token from /v1/auth/login",
+            "production_note": "Add API keys or OAuth before handling sensitive public production traffic.",
+        },
+        "discovery": {
+            "agent_card": f"{base_url}/.well-known/agent-card.json",
+            "agent_card_alias": f"{base_url}/.well-known/agent.json",
+            "agent_openapi": f"{base_url}/agent-openapi.json",
+            "llms_txt": f"{base_url}/llms.txt",
+        },
+        "workflow": [
+            {
+                "step": 1,
+                "name": "Create consultation",
+                "method": "POST",
+                "path": "/v1/consultations",
+                "result": "Returns consultation.id and consultation.queue_number.",
+            },
+            {
+                "step": 2,
+                "name": "Check queue and status",
+                "method": "GET",
+                "path": "/v1/consultations/{id}",
+                "result": "Returns status, queue_position, SLA due time, and latest AI triage event.",
+            },
+            {
+                "step": 3,
+                "name": "Send updates",
+                "method": "POST",
+                "path": "/v1/consultations/{id}/messages",
+                "result": "Adds a customer or agent message to the consultation.",
+            },
+            {
+                "step": 4,
+                "name": "Request human handoff",
+                "method": "POST",
+                "path": "/v1/consultations/{id}/handoff",
+                "result": "Moves the consultation back to the human support queue.",
+            },
+        ],
+        "public_endpoints": [
+            {
+                "method": "POST",
+                "path": "/v1/consultations",
+                "operation_id": "createSupportConsultation",
+                "auth": "none",
+            },
+            {
+                "method": "GET",
+                "path": "/v1/consultations/{id}",
+                "operation_id": "getSupportConsultation",
+                "auth": "none",
+            },
+            {
+                "method": "GET",
+                "path": "/v1/consultations/{id}/messages",
+                "operation_id": "listConsultationMessages",
+                "auth": "none",
+            },
+            {
+                "method": "POST",
+                "path": "/v1/consultations/{id}/messages",
+                "operation_id": "postConsultationMessage",
+                "auth": "none for public/agent messages; bearer token for admin replies",
+            },
+            {
+                "method": "POST",
+                "path": "/v1/consultations/{id}/handoff",
+                "operation_id": "requestHumanHandoff",
+                "auth": "none",
+            },
+        ],
+        "status_values": {
+            "waiting_human": "Waiting for an available support admin.",
+            "assigned": "Assigned to an admin but not yet active.",
+            "active": "Admin is actively handling the consultation.",
+            "needs_expert_review": "Marked for specialist review.",
+            "resolved": "Consultation is closed.",
+        },
+        "example_create_request": create_body,
+        "code_examples": {
+            "create_consultation": (
+                f"curl -X POST {base_url}/v1/consultations "
+                "-H 'Content-Type: application/json' "
+                f"-d '{json.dumps(create_body)}'"
+            ),
+            "get_consultation": f"curl {base_url}/v1/consultations/{{consultation_id}}",
+            "post_message": (
+                f"curl -X POST {base_url}/v1/consultations/{{consultation_id}}/messages "
+                "-H 'Content-Type: application/json' "
+                "-d '{\"content\":\"The user confirmed their account email.\",\"role\":\"agent\",\"language\":\"en\"}'"
+            ),
+            "request_handoff": (
+                f"curl -X POST {base_url}/v1/consultations/{{consultation_id}}/handoff "
+                "-H 'Content-Type: application/json' "
+                "-d '{\"reason\":\"The AI tool needs a human support admin to continue.\"}'"
+            ),
+        },
+        "agent_instructions": [
+            "Use source='agent' when creating a consultation for a user.",
+            "Persist consultation.id. It is required for status, messages, and handoff.",
+            "Show consultation.queue_number to the user as their support number.",
+            "Poll the status endpoint conservatively. Do not spam public write endpoints.",
+            "Do not call /v1/admin/* endpoints; they are for authenticated human support admins.",
+        ],
+        "rate_limits": {
+            "public_write_window_seconds": PUBLIC_RATE_LIMIT_WINDOW_SECONDS,
+            "public_write_max_requests": PUBLIC_RATE_LIMIT_MAX_REQUESTS,
+        },
+    }
+
+
+@app.get(
+    "/.well-known/agent-card.json",
+    tags=["Agent Discovery"],
+    summary="Get the public A2A-style agent card",
+    operation_id="getAgentCard",
+)
+def get_agent_card(request: Request) -> dict[str, Any]:
+    return agent_card_payload(public_base_url(request))
+
+
+@app.get("/.well-known/agent.json", include_in_schema=False)
+def get_agent_card_alias(request: Request) -> dict[str, Any]:
+    return agent_card_payload(public_base_url(request))
+
+
+@app.get(
+    "/agent-door.json",
+    tags=["Agent Discovery"],
+    summary="Get the machine-readable support queue workflow",
+    operation_id="getAgentDoorGuide",
+)
+def get_agent_door(request: Request) -> dict[str, Any]:
+    return agent_door_payload(public_base_url(request))
+
+
+@app.get(
+    "/llms.txt",
+    response_class=PlainTextResponse,
+    tags=["Agent Discovery"],
+    summary="Get a short LLM-readable guide",
+    operation_id="getLlmsTxt",
+)
+def get_llms_txt(request: Request) -> str:
+    base_url = public_base_url(request)
+    create_body = json.dumps(
+        {
+            "customer_name": "Agent User",
+            "customer_email": "user@example.com",
+            "language": "en",
+            "topic": "Login verification failed",
+            "description": "The user cannot sign in after password reset and needs a human support admin.",
+            "source": "agent",
+        },
+        indent=2,
+    )
+    return "\n".join(
+        [
+            "# Public Agent Customer Support Door",
+            "",
+            f"Base URL: {base_url}",
+            "Purpose: let AI tools create a support consultation, receive a queue number, post updates, and request human handoff.",
+            "",
+            "Discovery:",
+            f"- Agent Card: {base_url}/.well-known/agent-card.json",
+            f"- Agent Guide JSON: {base_url}/agent-door.json",
+            f"- Public Agent OpenAPI: {base_url}/agent-openapi.json",
+            f"- Full developer Swagger docs: {base_url}/docs",
+            "",
+            "Queue workflow:",
+            "1. POST /v1/consultations with source='agent'.",
+            "2. Read consultation.id and consultation.queue_number from the response.",
+            "3. GET /v1/consultations/{id} to check status and queue position.",
+            "4. POST /v1/consultations/{id}/messages to add user or agent updates.",
+            "5. POST /v1/consultations/{id}/handoff when a human support admin is needed.",
+            "",
+            "Create consultation example:",
+            f"curl -X POST {base_url}/v1/consultations \\",
+            '  -H "Content-Type: application/json" \\',
+            f"  -d '{create_body}'",
+            "",
+            "Post message example:",
+            f"curl -X POST {base_url}/v1/consultations/{{consultation_id}}/messages \\",
+            '  -H "Content-Type: application/json" \\',
+            '  -d \'{"content":"The user confirmed their account email.","role":"agent","language":"en"}\'',
+            "",
+            "Request handoff example:",
+            f"curl -X POST {base_url}/v1/consultations/{{consultation_id}}/handoff \\",
+            '  -H "Content-Type: application/json" \\',
+            '  -d \'{"reason":"The AI tool needs a human support admin to continue."}\'',
+            "",
+            "Public consultation endpoints require no API key for this MVP. Admin endpoints require login.",
+        ]
+    )
+
+
+@app.get(
+    "/agent-openapi.json",
+    tags=["Agent Discovery"],
+    summary="Get public-only OpenAPI for external AI tools",
+    operation_id="getAgentOpenApi",
+)
+def get_agent_openapi() -> dict[str, Any]:
+    schema = json.loads(json.dumps(app.openapi()))
+    allowed_paths = {
+        "/.well-known/agent-card.json",
+        "/agent-door.json",
+        "/agent-openapi.json",
+        "/llms.txt",
+        "/health",
+        "/v1/consultations",
+    }
+    schema["paths"] = {
+        path: methods
+        for path, methods in schema.get("paths", {}).items()
+        if path in allowed_paths or path.startswith("/v1/consultations/")
+    }
+    schema["tags"] = [
+        tag
+        for tag in schema.get("tags", [])
+        if tag.get("name") in {"Agent Discovery", "Public Consultations", "System"}
+    ]
+    schema["info"] = {
+        **schema.get("info", {}),
+        "title": "Public Agent Customer Support Door - Agent API",
+        "description": (
+            "Public-only OpenAPI contract for AI tools. Use this file to create consultations, "
+            "check queue status, post messages, and request human handoff. Admin routes are excluded."
+        ),
+    }
+    return schema
+
+
 @app.on_event("startup")
 def startup() -> None:
     init_db()
 
 
-@app.get("/health")
+@app.get("/health", tags=["System"], summary="Health check", operation_id="getHealth")
 def health() -> dict[str, str]:
     return {"status": "ok", "time": now()}
 
 
-@app.post("/v1/auth/login")
+@app.post("/v1/auth/login", tags=["Admin Auth"], summary="Log in a support admin", operation_id="loginAdmin")
 def login(payload: LoginRequest) -> dict[str, Any]:
     with connect() as conn:
         user = conn.execute("SELECT * FROM admin_users WHERE email = ?", (payload.email,)).fetchone()
@@ -423,13 +845,13 @@ def login(payload: LoginRequest) -> dict[str, Any]:
         return {"token": token, "expires_at": expires.isoformat(), "user": clean}
 
 
-@app.get("/v1/auth/me")
+@app.get("/v1/auth/me", tags=["Admin Auth"], summary="Get current admin session", operation_id="getCurrentAdmin")
 def me(user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
     user.pop("password_hash", None)
     return {"user": user}
 
 
-@app.post("/v1/auth/logout", status_code=204)
+@app.post("/v1/auth/logout", status_code=204, tags=["Admin Auth"], summary="Log out admin session", operation_id="logoutAdmin")
 def logout(response: Response, user: dict[str, Any] = Depends(current_user), authorization: str | None = Header(default=None)) -> Response:
     token = authorization.removeprefix("Bearer ").strip() if authorization else ""
     with connect() as conn:
@@ -439,7 +861,7 @@ def logout(response: Response, user: dict[str, Any] = Depends(current_user), aut
     return response
 
 
-@app.patch("/v1/admin/me/status")
+@app.patch("/v1/admin/me/status", tags=["Admin Queue"], summary="Set admin availability status", operation_id="setAdminStatus")
 def set_status(payload: StatusRequest, user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
     with connect() as conn:
         conn.execute(
@@ -453,8 +875,19 @@ def set_status(payload: StatusRequest, user: dict[str, Any] = Depends(current_us
         return {"user": out}
 
 
-@app.post("/v1/consultations", status_code=201)
-def create_consultation(payload: ConsultationCreate) -> dict[str, Any]:
+@app.post(
+    "/v1/consultations",
+    status_code=201,
+    tags=["Public Consultations"],
+    summary="Create a public support consultation and receive a queue number",
+    description=(
+        "Public no-key endpoint for humans and external AI tools. "
+        "Use source='agent' when ChatGPT, Gemini, or another agent creates the request for a user."
+    ),
+    operation_id="createSupportConsultation",
+)
+def create_consultation(payload: ConsultationCreate, request: Request) -> dict[str, Any]:
+    ip_hash = enforce_public_rate_limit(request)
     with connect() as conn:
         triage = classify_case(payload.topic, payload.description, payload.language)
         consultation_id = str(uuid.uuid4())
@@ -515,7 +948,12 @@ def create_consultation(payload: ConsultationCreate) -> dict[str, Any]:
             actor_id=None,
             action="create_consultation",
             consultation_id=consultation_id,
-            details={"queue_number": queue_number, "classification": triage["classification"]},
+            details={
+                "queue_number": queue_number,
+                "classification": triage["classification"],
+                "ip_hash": ip_hash,
+                "source": payload.source,
+            },
         )
         auto_assign_waiting(conn)
         consultation = conn.execute("SELECT * FROM consultations WHERE id = ?", (consultation_id,)).fetchone()
@@ -523,7 +961,12 @@ def create_consultation(payload: ConsultationCreate) -> dict[str, Any]:
         return {"consultation": row_dict(consultation), "ai_event": row_dict(ai_event)}
 
 
-@app.get("/v1/consultations/{consultation_id}")
+@app.get(
+    "/v1/consultations/{consultation_id}",
+    tags=["Public Consultations"],
+    summary="Read consultation status and queue position",
+    operation_id="getSupportConsultation",
+)
 def get_consultation(consultation_id: str) -> dict[str, Any]:
     with connect() as conn:
         consultation = conn.execute("SELECT * FROM consultations WHERE id = ?", (consultation_id,)).fetchone()
@@ -546,7 +989,12 @@ def get_consultation(consultation_id: str) -> dict[str, Any]:
         return {"consultation": out, "ai_event": row_dict(ai_event)}
 
 
-@app.get("/v1/consultations/{consultation_id}/messages")
+@app.get(
+    "/v1/consultations/{consultation_id}/messages",
+    tags=["Public Consultations"],
+    summary="List consultation messages",
+    operation_id="listConsultationMessages",
+)
 def get_messages(consultation_id: str) -> dict[str, Any]:
     with connect() as conn:
         exists = conn.execute("SELECT id FROM consultations WHERE id = ?", (consultation_id,)).fetchone()
@@ -559,12 +1007,24 @@ def get_messages(consultation_id: str) -> dict[str, Any]:
         return {"messages": rows_dict(messages)}
 
 
-@app.post("/v1/consultations/{consultation_id}/messages", status_code=201)
+@app.post(
+    "/v1/consultations/{consultation_id}/messages",
+    status_code=201,
+    tags=["Public Consultations"],
+    summary="Post a customer, agent, or admin message",
+    description=(
+        "Public callers can post customer or agent messages without an API key. "
+        "If a valid admin bearer token is supplied, the message is recorded as an admin reply."
+    ),
+    operation_id="postConsultationMessage",
+)
 def post_message(
     consultation_id: str,
     payload: MessageCreate,
+    request: Request,
     user: dict[str, Any] | None = Depends(optional_user),
 ) -> dict[str, Any]:
+    ip_hash = None if user else enforce_public_rate_limit(request)
     with connect() as conn:
         consultation = conn.execute("SELECT * FROM consultations WHERE id = ?", (consultation_id,)).fetchone()
         if not consultation:
@@ -603,14 +1063,20 @@ def post_message(
             actor_id=actor_id,
             action="post_message",
             consultation_id=consultation_id,
-            details={"role": role, "status_after": new_status},
+            details={"role": role, "status_after": new_status, "ip_hash": ip_hash},
         )
         message = conn.execute("SELECT * FROM messages WHERE id = ?", (message_id,)).fetchone()
         return {"message": row_dict(message)}
 
 
-@app.post("/v1/consultations/{consultation_id}/handoff")
-def handoff(consultation_id: str, payload: HandoffRequest) -> dict[str, Any]:
+@app.post(
+    "/v1/consultations/{consultation_id}/handoff",
+    tags=["Public Consultations"],
+    summary="Request human support handoff",
+    operation_id="requestHumanHandoff",
+)
+def handoff(consultation_id: str, payload: HandoffRequest, request: Request) -> dict[str, Any]:
+    ip_hash = enforce_public_rate_limit(request)
     with connect() as conn:
         consultation = conn.execute("SELECT * FROM consultations WHERE id = ?", (consultation_id,)).fetchone()
         if not consultation:
@@ -636,14 +1102,14 @@ def handoff(consultation_id: str, payload: HandoffRequest) -> dict[str, Any]:
             actor_id=None,
             action="handoff",
             consultation_id=consultation_id,
-            details={"reason": payload.reason},
+            details={"reason": payload.reason, "ip_hash": ip_hash},
         )
         auto_assign_waiting(conn)
         updated = conn.execute("SELECT * FROM consultations WHERE id = ?", (consultation_id,)).fetchone()
         return {"consultation": row_dict(updated)}
 
 
-@app.get("/v1/admin/queue")
+@app.get("/v1/admin/queue", tags=["Admin Queue"], summary="Get authenticated admin queue", operation_id="getAdminQueue")
 def admin_queue(user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
     with connect() as conn:
         auto_assign_waiting(conn)
@@ -690,7 +1156,12 @@ def admin_queue(user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
         }
 
 
-@app.patch("/v1/admin/consultations/{consultation_id}")
+@app.patch(
+    "/v1/admin/consultations/{consultation_id}",
+    tags=["Admin Queue"],
+    summary="Update consultation status, assignment, or priority",
+    operation_id="updateAdminConsultation",
+)
 def patch_consultation(
     consultation_id: str,
     payload: ConsultationPatch,
@@ -737,7 +1208,7 @@ def patch_consultation(
         return {"consultation": row_dict(updated)}
 
 
-@app.get("/v1/admin/audit-log")
+@app.get("/v1/admin/audit-log", tags=["Admin Queue"], summary="Get supervisor audit log", operation_id="getAuditLog")
 def audit_log(user: dict[str, Any] = Depends(require_supervisor)) -> dict[str, Any]:
     with connect() as conn:
         rows = conn.execute("SELECT * FROM audit_log ORDER BY created_at DESC LIMIT 80").fetchall()
@@ -758,7 +1229,17 @@ def serve_frontend_root() -> FileResponse:
 
 @app.get("/{full_path:path}", include_in_schema=False)
 def serve_frontend_path(full_path: str) -> FileResponse:
-    reserved_prefixes = ("v1/", "health", "docs", "openapi.json", "redoc")
+    reserved_prefixes = (
+        "v1/",
+        "health",
+        "docs",
+        "openapi.json",
+        "redoc",
+        ".well-known/",
+        "agent-door.json",
+        "agent-openapi.json",
+        "llms.txt",
+    )
     if full_path.startswith(reserved_prefixes):
         raise HTTPException(status_code=404, detail="Not found")
 

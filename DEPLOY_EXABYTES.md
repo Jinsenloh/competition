@@ -64,9 +64,11 @@ FRONTEND_DIST_DIR=/home/YOUR_CPANEL_USER/support-counter/dist
 SUPPORT_COUNTER_DB=/home/YOUR_CPANEL_USER/support-counter/backend/agent_support_counter.db
 SUPPORT_COUNTER_ADMIN_PASSWORD=choose-a-strong-admin-password
 SUPPORT_COUNTER_SUPERVISOR_PASSWORD=choose-a-strong-supervisor-password
+PUBLIC_BASE_URL=https://yourdomain.com
+SUPPORT_COUNTER_CORS_ORIGINS=https://yourdomain.com
 ```
 
-If the frontend and API are on different domains, also add:
+If the frontend and API are on different domains, set `SUPPORT_COUNTER_CORS_ORIGINS` to the frontend domain instead:
 
 ```text
 SUPPORT_COUNTER_CORS_ORIGINS=https://yourdomain.com
@@ -81,6 +83,11 @@ Restart the app from cPanel, then check:
 ```text
 https://yourdomain.com/health
 https://yourdomain.com/docs
+https://yourdomain.com/openapi.json
+https://yourdomain.com/agent-openapi.json
+https://yourdomain.com/.well-known/agent-card.json
+https://yourdomain.com/agent-door.json
+https://yourdomain.com/llms.txt
 https://yourdomain.com/
 ```
 
