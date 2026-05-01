@@ -28,6 +28,7 @@ const handoffCurl = `curl -X POST ${API_BASE}/v1/consultations/{consultation_id}
   }'`;
 
 const discoveryLinks = [
+  ['MCP SSE server', `${API_BASE}/mcp/sse`, 'Tool server for agents that can call MCP tools.'],
   ['Agent card', `${API_BASE}/.well-known/agent-card.json`, 'A2A-style discovery document.'],
   ['Agent card alias', `${API_BASE}/.well-known/agent.json`, 'Compatibility discovery path.'],
   ['Agent guide JSON', `${API_BASE}/agent-door.json`, 'Machine-readable queue workflow.'],
@@ -44,6 +45,23 @@ const endpoints = [
   ['GET', '/v1/consultations/{id}/messages', 'Read conversation messages. No auth required.'],
   ['POST', '/v1/consultations/{id}/messages', 'Post a user or agent update. No auth required.'],
   ['POST', '/v1/consultations/{id}/handoff', 'Request human support handoff. No auth required.'],
+];
+
+const mcpConfig = `{
+  "mcpServers": {
+    "support-door": {
+      "url": "${API_BASE}/mcp/sse"
+    }
+  }
+}`;
+
+const mcpTools = [
+  ['create_support_consultation', 'Create a support consultation and receive a queue number.'],
+  ['get_support_consultation', 'Read status, queue position, and AI triage.'],
+  ['list_consultation_messages', 'List all messages for a consultation.'],
+  ['post_consultation_message', 'Post a customer or agent update.'],
+  ['request_human_handoff', 'Escalate the consultation to the human queue.'],
+  ['get_agent_door_guide', 'Read the machine-readable door guide through MCP.'],
 ];
 
 const responseShape = `{
@@ -98,8 +116,34 @@ function App() {
       </section>
 
       <section>
-        <h2>2. Queue Flow</h2>
+        <h2>2. MCP Tool Server</h2>
+        <p>
+          Agents that support MCP should connect to the SSE endpoint below. This is the preferred path when
+          an AI tool can read pages but cannot directly post through a normal browser session.
+        </p>
+        <pre>{mcpConfig}</pre>
+        <table>
+          <thead>
+            <tr>
+              <th>Tool</th>
+              <th>Use</th>
+            </tr>
+          </thead>
+          <tbody>
+            {mcpTools.map(([tool, use]) => (
+              <tr key={tool}>
+                <td><code>{tool}</code></td>
+                <td>{use}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </section>
+
+      <section>
+        <h2>3. Queue Flow</h2>
         <ol>
+          <li>Preferred: connect to <code>{`${API_BASE}/mcp/sse`}</code> and call <code>create_support_consultation</code>.</li>
           <li>Fetch <code>/.well-known/agent-card.json</code> or <code>/llms.txt</code>.</li>
           <li>Create a consultation with <code>POST /v1/consultations</code> and <code>source: "agent"</code>.</li>
           <li>Store <code>consultation.id</code> and show <code>consultation.queue_number</code> to the user.</li>
@@ -110,32 +154,32 @@ function App() {
       </section>
 
       <section>
-        <h2>3. Create Queue Ticket</h2>
+        <h2>4. Create Queue Ticket</h2>
         <pre>{createConsultationCurl}</pre>
       </section>
 
       <section>
-        <h2>4. Expected Create Response</h2>
+        <h2>5. Expected Create Response</h2>
         <pre>{responseShape}</pre>
       </section>
 
       <section>
-        <h2>5. Check Status</h2>
+        <h2>6. Check Status</h2>
         <pre>{getConsultationCurl}</pre>
       </section>
 
       <section>
-        <h2>6. Post Agent Message</h2>
+        <h2>7. Post Agent Message</h2>
         <pre>{postMessageCurl}</pre>
       </section>
 
       <section>
-        <h2>7. Request Human Handoff</h2>
+        <h2>8. Request Human Handoff</h2>
         <pre>{handoffCurl}</pre>
       </section>
 
       <section>
-        <h2>8. Public Endpoint Index</h2>
+        <h2>9. Public Endpoint Index</h2>
         <table>
           <thead>
             <tr>
@@ -157,7 +201,7 @@ function App() {
       </section>
 
       <section>
-        <h2>9. Notes For Agents</h2>
+        <h2>10. Notes For Agents</h2>
         <ul>
           <li>Public consultation endpoints do not require an API key in this MVP.</li>
           <li>Admin endpoints under <code>/v1/admin/*</code> are private and require login.</li>

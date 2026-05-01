@@ -15,6 +15,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response, 
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
+from mcp.server.fastmcp import FastMCP
 from pydantic import BaseModel, Field
 
 
@@ -98,7 +99,10 @@ def client_hash(request: Request) -> str:
 
 
 def enforce_public_rate_limit(request: Request) -> str:
-    key = client_hash(request)
+    return enforce_public_rate_limit_key(client_hash(request))
+
+
+def enforce_public_rate_limit_key(key: str) -> str:
     current = time.monotonic()
     recent = [
         timestamp
@@ -427,6 +431,179 @@ def auto_assign_waiting(conn: sqlite3.Connection) -> None:
         )
 
 
+def create_consultation_record(payload: ConsultationCreate, *, ip_hash: str | None = None) -> dict[str, Any]:
+    with connect() as conn:
+        triage = classify_case(payload.topic, payload.description, payload.language)
+        consultation_id = str(uuid.uuid4())
+        queue_number = next_queue_number(conn)
+        created = now()
+        due = (datetime.now(timezone.utc) + timedelta(minutes=15 if triage["priority"] == "high" else 30)).isoformat()
+        conn.execute(
+            """
+            INSERT INTO consultations (
+              id, queue_number, source, customer_name, customer_email, language, topic, description,
+              priority, status, document_checklist, created_at, updated_at, first_response_due_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'waiting_human', ?, ?, ?, ?)
+            """,
+            (
+                consultation_id,
+                queue_number,
+                payload.source,
+                payload.customer_name,
+                payload.customer_email,
+                payload.language,
+                payload.topic,
+                payload.description,
+                triage["priority"],
+                json.dumps(triage["documents"]),
+                created,
+                created,
+                due,
+            ),
+        )
+        initial_role = "agent" if payload.source == "agent" else "customer"
+        conn.execute(
+            """
+            INSERT INTO messages (id, consultation_id, role, sender_name, content, language, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (str(uuid.uuid4()), consultation_id, initial_role, payload.customer_name, payload.description, payload.language, created),
+        )
+        conn.execute(
+            """
+            INSERT INTO ai_events (id, consultation_id, classification, summary, confidence, suggested_reply, escalation_reason, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                str(uuid.uuid4()),
+                consultation_id,
+                triage["classification"],
+                f"{payload.customer_name} needs help with {payload.topic}. {payload.description[:220]}",
+                triage["confidence"],
+                triage["suggested_reply"],
+                triage["escalation_reason"],
+                created,
+            ),
+        )
+        audit(
+            conn,
+            actor_type=payload.source,
+            actor_id=None,
+            action="create_consultation",
+            consultation_id=consultation_id,
+            details={
+                "queue_number": queue_number,
+                "classification": triage["classification"],
+                "ip_hash": ip_hash,
+                "source": payload.source,
+            },
+        )
+        auto_assign_waiting(conn)
+        consultation = conn.execute("SELECT * FROM consultations WHERE id = ?", (consultation_id,)).fetchone()
+        ai_event = conn.execute("SELECT * FROM ai_events WHERE consultation_id = ?", (consultation_id,)).fetchone()
+        return {"consultation": row_dict(consultation), "ai_event": row_dict(ai_event)}
+
+
+def get_consultation_payload(consultation_id: str) -> dict[str, Any]:
+    with connect() as conn:
+        consultation = conn.execute("SELECT * FROM consultations WHERE id = ?", (consultation_id,)).fetchone()
+        if not consultation:
+            raise HTTPException(status_code=404, detail="Consultation not found")
+        ahead = conn.execute(
+            """
+            SELECT COUNT(*) AS n FROM consultations
+            WHERE status IN ('waiting_human', 'assigned', 'active', 'needs_expert_review')
+              AND created_at < ?
+            """,
+            (consultation["created_at"],),
+        ).fetchone()["n"]
+        ai_event = conn.execute(
+            "SELECT * FROM ai_events WHERE consultation_id = ? ORDER BY created_at DESC LIMIT 1",
+            (consultation_id,),
+        ).fetchone()
+        out = row_dict(consultation) or {}
+        out["queue_position"] = ahead + 1 if out["status"] != "resolved" else 0
+        return {"consultation": out, "ai_event": row_dict(ai_event)}
+
+
+def list_messages_payload(consultation_id: str) -> dict[str, Any]:
+    with connect() as conn:
+        exists = conn.execute("SELECT id FROM consultations WHERE id = ?", (consultation_id,)).fetchone()
+        if not exists:
+            raise HTTPException(status_code=404, detail="Consultation not found")
+        messages = conn.execute(
+            "SELECT * FROM messages WHERE consultation_id = ? ORDER BY created_at ASC",
+            (consultation_id,),
+        ).fetchall()
+        return {"messages": rows_dict(messages)}
+
+
+def post_public_message_record(
+    consultation_id: str,
+    payload: MessageCreate,
+    *,
+    ip_hash: str | None = None,
+) -> dict[str, Any]:
+    with connect() as conn:
+        consultation = conn.execute("SELECT * FROM consultations WHERE id = ?", (consultation_id,)).fetchone()
+        if not consultation:
+            raise HTTPException(status_code=404, detail="Consultation not found")
+        message_id = str(uuid.uuid4())
+        sender_name = "External Agent" if payload.role == "agent" else "Customer"
+        conn.execute(
+            """
+            INSERT INTO messages (id, consultation_id, role, sender_name, content, language, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (message_id, consultation_id, payload.role, sender_name, payload.content, payload.language, now()),
+        )
+        conn.execute("UPDATE consultations SET updated_at = ? WHERE id = ?", (now(), consultation_id))
+        audit(
+            conn,
+            actor_type=payload.role,
+            actor_id=None,
+            action="post_message",
+            consultation_id=consultation_id,
+            details={"role": payload.role, "status_after": consultation["status"], "ip_hash": ip_hash},
+        )
+        message = conn.execute("SELECT * FROM messages WHERE id = ?", (message_id,)).fetchone()
+        return {"message": row_dict(message)}
+
+
+def request_handoff_record(consultation_id: str, reason: str, *, ip_hash: str | None = None) -> dict[str, Any]:
+    with connect() as conn:
+        consultation = conn.execute("SELECT * FROM consultations WHERE id = ?", (consultation_id,)).fetchone()
+        if not consultation:
+            raise HTTPException(status_code=404, detail="Consultation not found")
+        conn.execute(
+            """
+            UPDATE consultations
+            SET status = 'waiting_human', assigned_admin_id = NULL, updated_at = ?
+            WHERE id = ?
+            """,
+            (now(), consultation_id),
+        )
+        conn.execute(
+            """
+            INSERT INTO ai_events (id, consultation_id, classification, summary, confidence, suggested_reply, escalation_reason, created_at)
+            VALUES (?, ?, 'AI handoff', ?, 0.42, 'A human support admin should review this conversation.', ?, ?)
+            """,
+            (str(uuid.uuid4()), consultation_id, f"AI requested handoff for {consultation['queue_number']}.", reason, now()),
+        )
+        audit(
+            conn,
+            actor_type="ai",
+            actor_id=None,
+            action="handoff",
+            consultation_id=consultation_id,
+            details={"reason": reason, "ip_hash": ip_hash},
+        )
+        auto_assign_waiting(conn)
+        updated = conn.execute("SELECT * FROM consultations WHERE id = ?", (consultation_id,)).fetchone()
+        return {"consultation": row_dict(updated)}
+
+
 def current_user(authorization: str | None = Header(default=None)) -> dict[str, Any]:
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Missing bearer token")
@@ -505,6 +682,93 @@ if (FRONTEND_DIST / "assets").exists():
     app.mount("/assets", StaticFiles(directory=FRONTEND_DIST / "assets"), name="assets")
 
 
+support_mcp = FastMCP(
+    "Public Agent Customer Support Door",
+    instructions=(
+        "Use these tools to create and manage public customer support consultations. "
+        "Create a consultation first, persist the returned consultation.id, show the queue_number to the user, "
+        "then use the id to check status, list messages, post updates, or request human handoff."
+    ),
+)
+
+
+@support_mcp.tool(
+    name="create_support_consultation",
+    description="Create a public support consultation and receive a queue number.",
+)
+def mcp_create_support_consultation(
+    customer_name: str,
+    topic: str,
+    description: str,
+    customer_email: str | None = None,
+    language: Literal["en", "ms"] = "en",
+) -> dict[str, Any]:
+    ip_hash = enforce_public_rate_limit_key("mcp-sse-public")
+    payload = ConsultationCreate(
+        customer_name=customer_name,
+        customer_email=customer_email,
+        language=language,
+        topic=topic,
+        description=description,
+        source="agent",
+    )
+    return create_consultation_record(payload, ip_hash=ip_hash)
+
+
+@support_mcp.tool(
+    name="get_support_consultation",
+    description="Read a consultation's current status, queue number, queue position, and AI triage summary.",
+)
+def mcp_get_support_consultation(consultation_id: str) -> dict[str, Any]:
+    return get_consultation_payload(consultation_id)
+
+
+@support_mcp.tool(
+    name="list_consultation_messages",
+    description="List all messages for a consultation in chronological order.",
+)
+def mcp_list_consultation_messages(consultation_id: str) -> dict[str, Any]:
+    return list_messages_payload(consultation_id)
+
+
+@support_mcp.tool(
+    name="post_consultation_message",
+    description="Post an update from the external agent or customer into an existing consultation.",
+)
+def mcp_post_consultation_message(
+    consultation_id: str,
+    content: str,
+    role: Literal["customer", "agent"] = "agent",
+    language: Literal["en", "ms"] = "en",
+) -> dict[str, Any]:
+    ip_hash = enforce_public_rate_limit_key("mcp-sse-public")
+    payload = MessageCreate(content=content, role=role, language=language)
+    return post_public_message_record(consultation_id, payload, ip_hash=ip_hash)
+
+
+@support_mcp.tool(
+    name="request_human_handoff",
+    description="Move a consultation back to the human support queue and explain why human help is needed.",
+)
+def mcp_request_human_handoff(
+    consultation_id: str,
+    reason: str = "The AI tool needs a human support admin to continue.",
+) -> dict[str, Any]:
+    ip_hash = enforce_public_rate_limit_key("mcp-sse-public")
+    return request_handoff_record(consultation_id, reason, ip_hash=ip_hash)
+
+
+@support_mcp.tool(
+    name="get_agent_door_guide",
+    description="Return the machine-readable guide for this support door, including REST and MCP discovery URLs.",
+)
+def mcp_get_agent_door_guide(base_url: str | None = None) -> dict[str, Any]:
+    return agent_door_payload(normalize_base_url(base_url) or PUBLIC_BASE_URL or "http://127.0.0.1:8787")
+
+
+app.mount("/mcp", support_mcp.sse_app(), name="mcp-sse")
+
+
 def agent_card_payload(base_url: str) -> dict[str, Any]:
     return {
         "schema_version": "0.3",
@@ -553,6 +817,7 @@ def agent_card_payload(base_url: str) -> dict[str, Any]:
             },
         ],
         "extensions": [
+            {"id": "mcp-sse", "name": "MCP SSE tool server", "url": f"{base_url}/mcp/sse"},
             {"id": "agent-openapi", "name": "Public agent OpenAPI contract", "url": f"{base_url}/agent-openapi.json"},
             {"id": "agent-door", "name": "Agent workflow guide", "url": f"{base_url}/agent-door.json"},
             {"id": "llms", "name": "LLM text guide", "url": f"{base_url}/llms.txt"},
@@ -585,8 +850,41 @@ def agent_door_payload(base_url: str) -> dict[str, Any]:
         "discovery": {
             "agent_card": f"{base_url}/.well-known/agent-card.json",
             "agent_card_alias": f"{base_url}/.well-known/agent.json",
+            "mcp_sse": f"{base_url}/mcp/sse",
             "agent_openapi": f"{base_url}/agent-openapi.json",
             "llms_txt": f"{base_url}/llms.txt",
+        },
+        "mcp": {
+            "transport": "sse",
+            "url": f"{base_url}/mcp/sse",
+            "message_endpoint": f"{base_url}/mcp/messages/",
+            "tools": [
+                {
+                    "name": "create_support_consultation",
+                    "description": "Create a support consultation and receive a queue number.",
+                },
+                {
+                    "name": "get_support_consultation",
+                    "description": "Read status, queue position, and AI triage for a consultation.",
+                },
+                {
+                    "name": "list_consultation_messages",
+                    "description": "List conversation messages for a consultation.",
+                },
+                {
+                    "name": "post_consultation_message",
+                    "description": "Post a customer or agent update.",
+                },
+                {
+                    "name": "request_human_handoff",
+                    "description": "Escalate the consultation to the human support queue.",
+                },
+                {
+                    "name": "get_agent_door_guide",
+                    "description": "Read this machine-readable guide through MCP.",
+                },
+            ],
+            "client_config_example": {"mcpServers": {"support-door": {"url": f"{base_url}/mcp/sse"}}},
         },
         "workflow": [
             {
@@ -743,6 +1041,7 @@ def get_llms_txt(request: Request) -> str:
             "Purpose: let AI tools create a support consultation, receive a queue number, post updates, and request human handoff.",
             "",
             "Discovery:",
+            f"- MCP SSE tool server: {base_url}/mcp/sse",
             f"- Agent Card: {base_url}/.well-known/agent-card.json",
             f"- Agent Guide JSON: {base_url}/agent-door.json",
             f"- Public Agent OpenAPI: {base_url}/agent-openapi.json",
@@ -769,6 +1068,17 @@ def get_llms_txt(request: Request) -> str:
             f"curl -X POST {base_url}/v1/consultations/{{consultation_id}}/handoff \\",
             '  -H "Content-Type: application/json" \\',
             '  -d \'{"reason":"The AI tool needs a human support admin to continue."}\'',
+            "",
+            "MCP SSE tools:",
+            "- create_support_consultation",
+            "- get_support_consultation",
+            "- list_consultation_messages",
+            "- post_consultation_message",
+            "- request_human_handoff",
+            "- get_agent_door_guide",
+            "",
+            "Example MCP server config:",
+            f'{{"mcpServers":{{"support-door":{{"url":"{base_url}/mcp/sse"}}}}}}',
             "",
             "Public consultation endpoints require no API key for this MVP. Admin endpoints require login.",
         ]
@@ -888,77 +1198,7 @@ def set_status(payload: StatusRequest, user: dict[str, Any] = Depends(current_us
 )
 def create_consultation(payload: ConsultationCreate, request: Request) -> dict[str, Any]:
     ip_hash = enforce_public_rate_limit(request)
-    with connect() as conn:
-        triage = classify_case(payload.topic, payload.description, payload.language)
-        consultation_id = str(uuid.uuid4())
-        queue_number = next_queue_number(conn)
-        created = now()
-        due = (datetime.now(timezone.utc) + timedelta(minutes=15 if triage["priority"] == "high" else 30)).isoformat()
-        conn.execute(
-            """
-            INSERT INTO consultations (
-              id, queue_number, source, customer_name, customer_email, language, topic, description,
-              priority, status, document_checklist, created_at, updated_at, first_response_due_at
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'waiting_human', ?, ?, ?, ?)
-            """,
-            (
-                consultation_id,
-                queue_number,
-                payload.source,
-                payload.customer_name,
-                payload.customer_email,
-                payload.language,
-                payload.topic,
-                payload.description,
-                triage["priority"],
-                json.dumps(triage["documents"]),
-                created,
-                created,
-                due,
-            ),
-        )
-        initial_role = "agent" if payload.source == "agent" else "customer"
-        conn.execute(
-            """
-            INSERT INTO messages (id, consultation_id, role, sender_name, content, language, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
-            (str(uuid.uuid4()), consultation_id, initial_role, payload.customer_name, payload.description, payload.language, created),
-        )
-        conn.execute(
-            """
-            INSERT INTO ai_events (id, consultation_id, classification, summary, confidence, suggested_reply, escalation_reason, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                str(uuid.uuid4()),
-                consultation_id,
-                triage["classification"],
-                f"{payload.customer_name} needs help with {payload.topic}. {payload.description[:220]}",
-                triage["confidence"],
-                triage["suggested_reply"],
-                triage["escalation_reason"],
-                created,
-            ),
-        )
-        audit(
-            conn,
-            actor_type=payload.source,
-            actor_id=None,
-            action="create_consultation",
-            consultation_id=consultation_id,
-            details={
-                "queue_number": queue_number,
-                "classification": triage["classification"],
-                "ip_hash": ip_hash,
-                "source": payload.source,
-            },
-        )
-        auto_assign_waiting(conn)
-        consultation = conn.execute("SELECT * FROM consultations WHERE id = ?", (consultation_id,)).fetchone()
-        ai_event = conn.execute("SELECT * FROM ai_events WHERE consultation_id = ?", (consultation_id,)).fetchone()
-        return {"consultation": row_dict(consultation), "ai_event": row_dict(ai_event)}
+    return create_consultation_record(payload, ip_hash=ip_hash)
 
 
 @app.get(
@@ -968,25 +1208,7 @@ def create_consultation(payload: ConsultationCreate, request: Request) -> dict[s
     operation_id="getSupportConsultation",
 )
 def get_consultation(consultation_id: str) -> dict[str, Any]:
-    with connect() as conn:
-        consultation = conn.execute("SELECT * FROM consultations WHERE id = ?", (consultation_id,)).fetchone()
-        if not consultation:
-            raise HTTPException(status_code=404, detail="Consultation not found")
-        ahead = conn.execute(
-            """
-            SELECT COUNT(*) AS n FROM consultations
-            WHERE status IN ('waiting_human', 'assigned', 'active', 'needs_expert_review')
-              AND created_at < ?
-            """,
-            (consultation["created_at"],),
-        ).fetchone()["n"]
-        ai_event = conn.execute(
-            "SELECT * FROM ai_events WHERE consultation_id = ? ORDER BY created_at DESC LIMIT 1",
-            (consultation_id,),
-        ).fetchone()
-        out = row_dict(consultation) or {}
-        out["queue_position"] = ahead + 1 if out["status"] != "resolved" else 0
-        return {"consultation": out, "ai_event": row_dict(ai_event)}
+    return get_consultation_payload(consultation_id)
 
 
 @app.get(
@@ -996,15 +1218,7 @@ def get_consultation(consultation_id: str) -> dict[str, Any]:
     operation_id="listConsultationMessages",
 )
 def get_messages(consultation_id: str) -> dict[str, Any]:
-    with connect() as conn:
-        exists = conn.execute("SELECT id FROM consultations WHERE id = ?", (consultation_id,)).fetchone()
-        if not exists:
-            raise HTTPException(status_code=404, detail="Consultation not found")
-        messages = conn.execute(
-            "SELECT * FROM messages WHERE consultation_id = ? ORDER BY created_at ASC",
-            (consultation_id,),
-        ).fetchall()
-        return {"messages": rows_dict(messages)}
+    return list_messages_payload(consultation_id)
 
 
 @app.post(
@@ -1024,7 +1238,9 @@ def post_message(
     request: Request,
     user: dict[str, Any] | None = Depends(optional_user),
 ) -> dict[str, Any]:
-    ip_hash = None if user else enforce_public_rate_limit(request)
+    if not user:
+        ip_hash = enforce_public_rate_limit(request)
+        return post_public_message_record(consultation_id, payload, ip_hash=ip_hash)
     with connect() as conn:
         consultation = conn.execute("SELECT * FROM consultations WHERE id = ?", (consultation_id,)).fetchone()
         if not consultation:
@@ -1063,7 +1279,7 @@ def post_message(
             actor_id=actor_id,
             action="post_message",
             consultation_id=consultation_id,
-            details={"role": role, "status_after": new_status, "ip_hash": ip_hash},
+            details={"role": role, "status_after": new_status, "ip_hash": None},
         )
         message = conn.execute("SELECT * FROM messages WHERE id = ?", (message_id,)).fetchone()
         return {"message": row_dict(message)}
@@ -1077,36 +1293,7 @@ def post_message(
 )
 def handoff(consultation_id: str, payload: HandoffRequest, request: Request) -> dict[str, Any]:
     ip_hash = enforce_public_rate_limit(request)
-    with connect() as conn:
-        consultation = conn.execute("SELECT * FROM consultations WHERE id = ?", (consultation_id,)).fetchone()
-        if not consultation:
-            raise HTTPException(status_code=404, detail="Consultation not found")
-        conn.execute(
-            """
-            UPDATE consultations
-            SET status = 'waiting_human', assigned_admin_id = NULL, updated_at = ?
-            WHERE id = ?
-            """,
-            (now(), consultation_id),
-        )
-        conn.execute(
-            """
-            INSERT INTO ai_events (id, consultation_id, classification, summary, confidence, suggested_reply, escalation_reason, created_at)
-            VALUES (?, ?, 'AI handoff', ?, 0.42, 'A human support admin should review this conversation.', ?, ?)
-            """,
-            (str(uuid.uuid4()), consultation_id, f"AI requested handoff for {consultation['queue_number']}.", payload.reason, now()),
-        )
-        audit(
-            conn,
-            actor_type="ai",
-            actor_id=None,
-            action="handoff",
-            consultation_id=consultation_id,
-            details={"reason": payload.reason, "ip_hash": ip_hash},
-        )
-        auto_assign_waiting(conn)
-        updated = conn.execute("SELECT * FROM consultations WHERE id = ?", (consultation_id,)).fetchone()
-        return {"consultation": row_dict(updated)}
+    return request_handoff_record(consultation_id, payload.reason, ip_hash=ip_hash)
 
 
 @app.get("/v1/admin/queue", tags=["Admin Queue"], summary="Get authenticated admin queue", operation_id="getAdminQueue")
@@ -1235,6 +1422,7 @@ def serve_frontend_path(full_path: str) -> FileResponse:
         "docs",
         "openapi.json",
         "redoc",
+        "mcp/",
         ".well-known/",
         "agent-door.json",
         "agent-openapi.json",

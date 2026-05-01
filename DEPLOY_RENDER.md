@@ -63,6 +63,7 @@ Check:
 ```text
 /health
 /docs
+/mcp/sse
 /openapi.json
 /agent-openapi.json
 /.well-known/agent-card.json

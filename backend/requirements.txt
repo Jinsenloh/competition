@@ -5,3 +5,4 @@ pydantic>=2.11.0
 email-validator>=2.2.0
 pytest>=8.3.4
 httpx>=0.28.1
+mcp>=1.26.0

@@ -83,6 +83,7 @@ Restart the app from cPanel, then check:
 ```text
 https://yourdomain.com/health
 https://yourdomain.com/docs
+https://yourdomain.com/mcp/sse
 https://yourdomain.com/openapi.json
 https://yourdomain.com/agent-openapi.json
 https://yourdomain.com/.well-known/agent-card.json
