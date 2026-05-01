@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: agent-support-counter
+    runtime: docker
+    plan: free
+    region: singapore
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /health
+    envVars:
+      - key: FRONTEND_DIST_DIR
+        value: /app/dist
+      - key: SUPPORT_COUNTER_DB
+        value: /tmp/agent_support_counter.db
+      - key: SUPPORT_COUNTER_ADMIN_PASSWORD
+        sync: false
+      - key: SUPPORT_COUNTER_SUPERVISOR_PASSWORD
+        sync: false
