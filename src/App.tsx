@@ -1,255 +1,63 @@
+import {
+  AlertTriangle,
+  ArrowRightLeft,
+  Bot,
+  CheckCircle2,
+  ClipboardList,
+  FileText,
+  Gauge,
+  Home,
+  LogOut,
+  MessageSquareText,
+  MonitorCheck,
+  PlayCircle,
+  Send,
+  ShieldCheck,
+  UserCheck,
+  Wifi,
+} from 'lucide-react';
 import { FormEvent, useCallback, useEffect, useMemo, useState } from 'react';
 import { api, API_BASE } from './api';
-import type { AuthState, Consultation, ConsultationStatus, QueuePayload } from './types';
+import { ConsultationRoom3D } from './components/ConsultationRoom3D';
+import type { AiEvent, AuthState, Consultation, ConsultationStatus, Language, Message, QueuePayload } from './types';
 
-type View = 'door' | 'queue';
+type View = 'public' | 'admin' | 'docs';
 
-const authKey = 'agent-door-operator-auth';
+const authKey = 'agent-support-counter-auth';
+const showDemoCredentials = import.meta.env.DEV || import.meta.env.VITE_SHOW_DEMO_CREDENTIALS === 'true';
 
 const statusText: Record<ConsultationStatus, string> = {
-  waiting_human: 'Waiting',
+  waiting_human: 'Waiting human',
   assigned: 'Assigned',
   active: 'Active',
-  needs_expert_review: 'Review',
+  needs_expert_review: 'Specialist review',
   resolved: 'Resolved',
 };
 
-const createConsultationCurl = `curl -X POST ${API_BASE}/v1/consultations \\
-  -H "Content-Type: application/json" \\
-  -d '{
-    "customer_name": "Agent User",
-    "customer_email": "user@example.com",
-    "language": "en",
-    "topic": "Login verification failed",
-    "description": "The user cannot sign in after password reset and needs human support.",
-    "source": "agent"
-  }'`;
-
-const getConsultationCurl = `curl ${API_BASE}/v1/consultations/{consultation_id}`;
-
-const postMessageCurl = `curl -X POST ${API_BASE}/v1/consultations/{consultation_id}/messages \\
-  -H "Content-Type: application/json" \\
-  -d '{
-    "content": "The user confirmed their account email.",
-    "role": "agent",
-    "language": "en"
-  }'`;
-
-const handoffCurl = `curl -X POST ${API_BASE}/v1/consultations/{consultation_id}/handoff \\
-  -H "Content-Type: application/json" \\
-  -d '{
-    "reason": "The AI tool needs a human support admin to continue."
-  }'`;
-
-const discoveryLinks = [
-  ['MCP SSE server', `${API_BASE}/mcp/sse`, 'Tool server for agents that can call MCP tools.'],
-  ['Agent card', `${API_BASE}/.well-known/agent-card.json`, 'A2A-style discovery document.'],
-  ['Agent card alias', `${API_BASE}/.well-known/agent.json`, 'Compatibility discovery path.'],
-  ['Agent guide JSON', `${API_BASE}/agent-door.json`, 'Machine-readable queue workflow.'],
-  ['LLMs text', `${API_BASE}/llms.txt`, 'Plain-text instructions for AI tools.'],
-  ['Agent OpenAPI', `${API_BASE}/agent-openapi.json`, 'Public-only REST schema for tool builders.'],
-];
-
-const endpoints = [
-  ['GET', '/.well-known/agent-card.json', 'Read public agent identity, skills, auth mode, and links.'],
-  ['GET', '/agent-door.json', 'Read exact queue workflow and endpoint list.'],
-  ['GET', '/llms.txt', 'Read short plain-text instructions.'],
-  ['POST', '/v1/consultations', 'Create a queue ticket. No auth required.'],
-  ['GET', '/v1/consultations/{id}', 'Read status, queue position, and AI triage. No auth required.'],
-  ['GET', '/v1/consultations/{id}/messages', 'Read conversation messages. No auth required.'],
-  ['POST', '/v1/consultations/{id}/messages', 'Post a user or agent update. No auth required.'],
-  ['POST', '/v1/consultations/{id}/handoff', 'Request human support handoff. No auth required.'],
-];
-
-const mcpConfig = `{
-  "mcpServers": {
-    "support-door": {
-      "url": "${API_BASE}/mcp/sse"
-    }
-  }
-}`;
-
-const mcpTools = [
-  ['create_support_consultation', 'Create a support consultation and receive a queue number.'],
-  ['get_support_consultation', 'Read status, queue position, and AI triage.'],
-  ['list_consultation_messages', 'List all messages for a consultation.'],
-  ['post_consultation_message', 'Post a customer or agent update.'],
-  ['request_human_handoff', 'Escalate the consultation to the human queue.'],
-  ['get_agent_door_guide', 'Read the machine-readable door guide through MCP.'],
-];
-
-const responseShape = `{
-  "consultation": {
-    "id": "uuid",
-    "queue_number": "SUP-1001",
-    "source": "agent",
-    "status": "waiting_human",
-    "queue_position": 1,
-    "first_response_due_at": "2026-05-01T12:30:00+00:00"
+const publicCopy = {
+  en: {
+    title: 'Take a number for customer support',
+    subtitle: 'Submit your issue, receive a queue number, and continue the chat while a remote support admin reviews your case.',
+    name: 'Full name',
+    email: 'Email',
+    topic: 'Topic',
+    details: 'Issue details',
+    submit: 'Get queue number',
+    chat: 'Send update',
+    placeholder: 'Describe your customer support issue clearly.',
   },
-  "ai_event": {
-    "classification": "Technical troubleshooting",
-    "summary": "Agent User needs help with Login verification failed.",
-    "confidence": 0.82,
-    "suggested_reply": "Thanks. I have prepared the initial summary..."
-  }
-}`;
-
-function App() {
-  const [view, setView] = useState<View>(() => (window.location.pathname === '/queue' ? 'queue' : 'door'));
-
-  function changeView(next: View) {
-    setView(next);
-    window.history.replaceState(null, '', next === 'queue' ? '/queue' : '/');
-  }
-
-  return (
-    <main className="agent-doc">
-      <nav className="top-nav" aria-label="Views">
-        <button className={view === 'door' ? 'selected' : ''} onClick={() => changeView('door')}>
-          Agent Door
-        </button>
-        <button className={view === 'queue' ? 'selected' : ''} onClick={() => changeView('queue')}>
-          Local Queue Viewer
-        </button>
-      </nav>
-      {view === 'door' ? <AgentDoor /> : <QueueViewer />}
-    </main>
-  );
-}
-
-function AgentDoor() {
-  return (
-    <>
-      <header className="doc-header">
-        <p className="kicker">Public Agent Door</p>
-        <h1>Customer Support Queue API</h1>
-        <p>
-          This page is intentionally documentation-only. AI tools such as ChatGPT, Gemini, custom agents,
-          and workflow automations can read the discovery files below, create a queue ticket, post updates,
-          and request human handoff through REST.
-        </p>
-        <p>
-          The public web surface is only this Agent Door. Customer portal and admin workspace screens are
-          separated from this page; agents should use the public endpoints listed here.
-        </p>
-        <p className="note">
-          Local URL: <code>{API_BASE}</code>. For public access, deploy with HTTPS and set{' '}
-          <code>PUBLIC_BASE_URL=https://your-domain.com</code>.
-        </p>
-      </header>
-
-      <section>
-        <h2>1. Discovery URLs</h2>
-        <div className="link-list">
-          {discoveryLinks.map(([label, href, detail]) => (
-            <a href={href} target="_blank" rel="noreferrer" key={href}>
-              <strong>{label}</strong>
-              <code>{href}</code>
-              <span>{detail}</span>
-            </a>
-          ))}
-        </div>
-      </section>
-
-      <section>
-        <h2>2. MCP Tool Server</h2>
-        <p>
-          Agents that support MCP should connect to the SSE endpoint below. This is the preferred path when
-          an AI tool can read pages but cannot directly post through a normal browser session.
-        </p>
-        <pre>{mcpConfig}</pre>
-        <table>
-          <thead>
-            <tr>
-              <th>Tool</th>
-              <th>Use</th>
-            </tr>
-          </thead>
-          <tbody>
-            {mcpTools.map(([tool, use]) => (
-              <tr key={tool}>
-                <td><code>{tool}</code></td>
-                <td>{use}</td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      </section>
-
-      <section>
-        <h2>3. Queue Flow</h2>
-        <ol>
-          <li>Preferred: connect to <code>{`${API_BASE}/mcp/sse`}</code> and call <code>create_support_consultation</code>.</li>
-          <li>Fetch <code>/.well-known/agent-card.json</code> or <code>/llms.txt</code>.</li>
-          <li>Create a consultation with <code>POST /v1/consultations</code> and <code>source: "agent"</code>.</li>
-          <li>Store <code>consultation.id</code> and show <code>consultation.queue_number</code> to the user.</li>
-          <li>Poll <code>GET /v1/consultations/{'{id}'}</code> for status and queue position.</li>
-          <li>Post updates with <code>POST /v1/consultations/{'{id}'}/messages</code>.</li>
-          <li>Request human takeover with <code>POST /v1/consultations/{'{id}'}/handoff</code>.</li>
-        </ol>
-      </section>
-
-      <section>
-        <h2>4. Create Queue Ticket</h2>
-        <pre>{createConsultationCurl}</pre>
-      </section>
-
-      <section>
-        <h2>5. Expected Create Response</h2>
-        <pre>{responseShape}</pre>
-      </section>
-
-      <section>
-        <h2>6. Check Status</h2>
-        <pre>{getConsultationCurl}</pre>
-      </section>
-
-      <section>
-        <h2>7. Post Agent Message</h2>
-        <pre>{postMessageCurl}</pre>
-      </section>
-
-      <section>
-        <h2>8. Request Human Handoff</h2>
-        <pre>{handoffCurl}</pre>
-      </section>
-
-      <section>
-        <h2>9. Public Endpoint Index</h2>
-        <table>
-          <thead>
-            <tr>
-              <th>Method</th>
-              <th>Path</th>
-              <th>Use</th>
-            </tr>
-          </thead>
-          <tbody>
-            {endpoints.map(([method, path, use]) => (
-              <tr key={`${method}-${path}`}>
-                <td><code>{method}</code></td>
-                <td><code>{path}</code></td>
-                <td>{use}</td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      </section>
-
-      <section>
-        <h2>10. Notes For Agents</h2>
-        <ul>
-          <li>Public consultation endpoints do not require an API key in this MVP.</li>
-          <li>Admin endpoints under <code>/v1/admin/*</code> are private and require login.</li>
-          <li>Valid languages are <code>en</code> and <code>ms</code>.</li>
-          <li>Valid public message roles are <code>customer</code> and <code>agent</code>.</li>
-          <li>Rate limiting is enabled on public write endpoints.</li>
-        </ul>
-      </section>
-    </>
-  );
-}
+  ms: {
+    title: 'Ambil nombor giliran sokongan pelanggan',
+    subtitle: 'Hantar isu anda, terima nombor giliran, dan teruskan chat sementara admin sokongan jarak jauh menyemak kes.',
+    name: 'Nama penuh',
+    email: 'Emel',
+    topic: 'Topik',
+    details: 'Butiran isu',
+    submit: 'Dapatkan nombor',
+    chat: 'Hantar mesej',
+    placeholder: 'Terangkan isu sokongan pelanggan dengan jelas.',
+  },
+};
 
 function readStoredAuth(): AuthState | null {
   const raw = localStorage.getItem(authKey);
@@ -268,162 +76,536 @@ function readStoredAuth(): AuthState | null {
 }
 
 function storeAuth(auth: AuthState | null) {
-  if (auth) localStorage.setItem(authKey, JSON.stringify(auth));
-  else localStorage.removeItem(authKey);
+  if (!auth) localStorage.removeItem(authKey);
+  else localStorage.setItem(authKey, JSON.stringify(auth));
 }
 
-function QueueViewer() {
+function formatClock(value?: string | null) {
+  if (!value) return '-';
+  return new Intl.DateTimeFormat('en-MY', {
+    hour: '2-digit',
+    minute: '2-digit',
+    day: '2-digit',
+    month: 'short',
+  }).format(new Date(value));
+}
+
+function minutesUntil(value: string) {
+  return Math.round((new Date(value).getTime() - Date.now()) / 60000);
+}
+
+function App() {
+  const [view, setView] = useState<View>('public');
   const [auth, setAuthState] = useState<AuthState | null>(() => readStoredAuth());
-  const [queue, setQueue] = useState<QueuePayload | null>(null);
-  const [error, setError] = useState('');
-  const [email, setEmail] = useState('admin@counter.local');
-  const [password, setPassword] = useState('');
-  const [busy, setBusy] = useState(false);
 
   const setAuth = (next: AuthState | null) => {
     setAuthState(next);
     storeAuth(next);
   };
 
-  const refreshQueue = useCallback(async () => {
-    if (!auth) return;
-    const payload = await api.queue(auth.token);
-    setQueue(payload);
-  }, [auth]);
+  return (
+    <div className="app-shell">
+      <header className="topbar">
+        <button className="brand" onClick={() => setView('public')} title="Open customer portal">
+          <span className="brand-mark">MY</span>
+          <span>Agent Support</span>
+        </button>
+        <nav className="nav-tabs" aria-label="Main views">
+          <button className={view === 'public' ? 'active' : ''} onClick={() => setView('public')}>
+            <Home size={16} /> Portal
+          </button>
+          <button className={view === 'admin' ? 'active' : ''} onClick={() => setView('admin')}>
+            <MonitorCheck size={16} /> Admin
+          </button>
+          <button className={view === 'docs' ? 'active' : ''} onClick={() => setView('docs')}>
+            <FileText size={16} /> API
+          </button>
+        </nav>
+        <div className="session-pill">
+          <Wifi size={15} />
+          {auth ? `${auth.user.name} - ${auth.user.role}` : 'Public'}
+        </div>
+      </header>
+
+      {view === 'public' && <PublicPortal />}
+      {view === 'admin' && (auth ? <AdminWorkspace auth={auth} setAuth={setAuth} /> : <LoginPanel setAuth={setAuth} />)}
+      {view === 'docs' && <AgentDocs />}
+    </div>
+  );
+}
+
+function LoginPanel({ setAuth }: { setAuth: (auth: AuthState) => void }) {
+  const [email, setEmail] = useState(showDemoCredentials ? 'admin@counter.local' : '');
+  const [password, setPassword] = useState(showDemoCredentials ? 'admin123' : '');
+  const [error, setError] = useState('');
+
+  async function submit(event: FormEvent) {
+    event.preventDefault();
+    setError('');
+    try {
+      const auth = await api.login(email, password);
+      setAuth(auth);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Unable to sign in');
+    }
+  }
+
+  return (
+    <main className="login-layout">
+      <section className="login-panel">
+        <div className="eyebrow"><ShieldCheck size={16} /> Secure WFH access</div>
+        <h1>Remote support workspace</h1>
+        <form onSubmit={submit} className="form-grid">
+          <label>
+            Email
+            <input value={email} onChange={(e) => setEmail(e.target.value)} />
+          </label>
+          <label>
+            Password
+            <input type="password" value={password} onChange={(e) => setPassword(e.target.value)} />
+          </label>
+          {error && <div className="error">{error}</div>}
+          <button className="primary-action" type="submit">
+            <PlayCircle size={18} /> Sign in
+          </button>
+        </form>
+        {showDemoCredentials && (
+          <div className="credential-strip">
+            <span>Admin: admin@counter.local / admin123</span>
+            <span>Supervisor: supervisor@counter.local / super123</span>
+          </div>
+        )}
+      </section>
+    </main>
+  );
+}
+
+function PublicPortal() {
+  const [language, setLanguage] = useState<Language>('en');
+  const [created, setCreated] = useState<Consultation | null>(null);
+  const [messages, setMessages] = useState<Message[]>([]);
+  const [form, setForm] = useState({
+    customer_name: '',
+    customer_email: '',
+    topic: '',
+    description: '',
+  });
+  const [chat, setChat] = useState('');
+  const [error, setError] = useState('');
+  const [busy, setBusy] = useState(false);
+  const copy = publicCopy[language];
+
+  const refresh = useCallback(async () => {
+    if (!created) return;
+    const [{ consultation }, messagePayload] = await Promise.all([
+      api.getConsultation(created.id),
+      api.getMessages(created.id),
+    ]);
+    setCreated(consultation);
+    setMessages(messagePayload.messages);
+  }, [created]);
 
   useEffect(() => {
-    if (!auth) return;
-    refreshQueue().catch((err) => setError(err instanceof Error ? err.message : 'Unable to load queue'));
-    const timer = window.setInterval(() => {
-      refreshQueue().catch(() => undefined);
-    }, 5000);
+    if (!created) return;
+    refresh();
+    const timer = window.setInterval(refresh, 4000);
     return () => window.clearInterval(timer);
-  }, [auth, refreshQueue]);
+  }, [created?.id, refresh]);
 
-  async function login(event: FormEvent) {
+  async function submit(event: FormEvent) {
     event.preventDefault();
     setBusy(true);
     setError('');
     try {
-      const next = await api.login(email, password);
-      setAuth(next);
-      await api.setStatus(next.token, 'online').catch(() => undefined);
+      const result = await api.createConsultation({
+        ...form,
+        customer_email: form.customer_email || undefined,
+        language,
+        source: 'public',
+      });
+      setCreated(result.consultation);
+      const messagePayload = await api.getMessages(result.consultation.id);
+      setMessages(messagePayload.messages);
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Unable to sign in');
+      setError(err instanceof Error ? err.message : 'Unable to create consultation');
     } finally {
       setBusy(false);
     }
   }
 
-  async function logout() {
-    if (auth) await api.logout(auth.token).catch(() => undefined);
-    setAuth(null);
-    setQueue(null);
+  async function sendChat(event: FormEvent) {
+    event.preventDefault();
+    if (!created || !chat.trim()) return;
+    await api.postMessage(created.id, chat, language);
+    setChat('');
+    refresh();
   }
 
-  const visibleTickets = useMemo(() => {
-    return (queue?.consultations ?? []).filter((ticket) => ticket.status !== 'resolved');
-  }, [queue]);
-
   return (
-    <>
-      <header className="doc-header">
-        <p className="kicker">Local Queue Viewer</p>
-        <h1>Watch Deployed MCP Tickets From Localhost</h1>
-        <p>
-          Run this frontend locally with <code>VITE_API_BASE</code> set to the deployed Render URL.
-          When an external agent calls the deployed MCP server, the ticket is stored in the deployed backend
-          and appears here after login.
-        </p>
-        <p className="note">
-          Current API target: <code>{API_BASE}</code>
-        </p>
-      </header>
+    <main className="public-layout">
+      <section className="portal-intake">
+        <div className="lang-toggle">
+          <button className={language === 'en' ? 'selected' : ''} onClick={() => setLanguage('en')}>EN</button>
+          <button className={language === 'ms' ? 'selected' : ''} onClick={() => setLanguage('ms')}>BM</button>
+        </div>
+        <div className="eyebrow"><ClipboardList size={16} /> Remote support queue</div>
+        <h1>{copy.title}</h1>
+        <p>{copy.subtitle}</p>
+        <form onSubmit={submit} className="form-grid">
+          <label>
+            {copy.name}
+            <input required value={form.customer_name} onChange={(e) => setForm({ ...form, customer_name: e.target.value })} />
+          </label>
+          <label>
+            {copy.email}
+            <input type="email" value={form.customer_email} onChange={(e) => setForm({ ...form, customer_email: e.target.value })} />
+          </label>
+          <label>
+            {copy.topic}
+            <input required value={form.topic} onChange={(e) => setForm({ ...form, topic: e.target.value })} />
+          </label>
+          <label>
+            {copy.details}
+            <textarea
+              required
+              rows={6}
+              placeholder={copy.placeholder}
+              value={form.description}
+              onChange={(e) => setForm({ ...form, description: e.target.value })}
+            />
+          </label>
+          {error && <div className="error">{error}</div>}
+          <button className="primary-action" disabled={busy} type="submit">
+            <ArrowRightLeft size={18} /> {busy ? '...' : copy.submit}
+          </button>
+        </form>
+      </section>
 
-      {!auth ? (
-        <section>
-          <h2>Admin Login</h2>
-          <form className="login-form" onSubmit={login}>
-            <label>
-              Email
-              <input value={email} onChange={(event) => setEmail(event.target.value)} />
-            </label>
-            <label>
-              Password
-              <input type="password" value={password} onChange={(event) => setPassword(event.target.value)} />
-            </label>
-            {error && <p className="error">{error}</p>}
-            <button type="submit" disabled={busy}>{busy ? 'Signing in...' : 'Sign in'}</button>
-          </form>
-        </section>
-      ) : (
-        <>
-          <section className="queue-toolbar">
-            <div>
-              <h2>{auth.user.name}</h2>
-              <p>{auth.user.role} connected to <code>{API_BASE}</code></p>
+      <section className="ticket-preview">
+        <ConsultationRoom3D consultation={created ?? undefined} latestMessage={messages[messages.length - 1]} />
+        {created ? (
+          <div className="queue-card">
+            <div className="queue-number">{created.queue_number}</div>
+            <div className={`status-badge ${created.status}`}>{statusText[created.status]}</div>
+            <div className="queue-meta">
+              <span>Position {created.queue_position ?? 1}</span>
+              <span>Due {formatClock(created.first_response_due_at)}</span>
             </div>
-            <div className="toolbar-actions">
-              <button onClick={() => refreshQueue().catch((err) => setError(err instanceof Error ? err.message : 'Refresh failed'))}>
-                Refresh
-              </button>
-              <button onClick={logout}>Logout</button>
-            </div>
-          </section>
-
-          {error && <p className="error">{error}</p>}
-
-          <section>
-            <h2>Queue Metrics</h2>
-            <div className="metrics-grid">
-              {(['waiting_human', 'assigned', 'active', 'needs_expert_review'] as ConsultationStatus[]).map((status) => (
-                <div className="metric" key={status}>
-                  <strong>{queue?.metrics[status] ?? 0}</strong>
-                  <span>{statusText[status]}</span>
-                </div>
+            <div className="doc-list">
+              {created.document_checklist.map((doc) => (
+                <span key={doc}>{doc}</span>
               ))}
             </div>
-          </section>
-
-          <section>
-            <h2>Live Tickets</h2>
-            <div className="ticket-grid">
-              {visibleTickets.length === 0 && <p>No active tickets yet.</p>}
-              {visibleTickets.map((ticket) => (
-                <TicketCard ticket={ticket} key={ticket.id} />
-              ))}
-            </div>
-          </section>
-        </>
-      )}
-    </>
+            <form onSubmit={sendChat} className="chat-compose">
+              <input value={chat} onChange={(e) => setChat(e.target.value)} placeholder={copy.placeholder} />
+              <button title={copy.chat} type="submit"><Send size={18} /></button>
+            </form>
+          </div>
+        ) : (
+          <div className="queue-card muted">
+            <div className="queue-number">SUP-0000</div>
+            <p>Your queue number and consultation room appear here.</p>
+          </div>
+        )}
+      </section>
+    </main>
   );
 }
 
-function TicketCard({ ticket }: { ticket: Consultation }) {
+function AdminWorkspace({ auth, setAuth }: { auth: AuthState; setAuth: (auth: AuthState | null) => void }) {
+  const [queue, setQueue] = useState<QueuePayload | null>(null);
+  const [selectedId, setSelectedId] = useState<string>('');
+  const [messages, setMessages] = useState<Message[]>([]);
+  const [reply, setReply] = useState('');
+  const [error, setError] = useState('');
+
+  const refreshQueue = useCallback(async () => {
+    const payload = await api.queue(auth.token);
+    setQueue(payload);
+    if (!selectedId) {
+      const first = payload.consultations.find((item) => item.status !== 'resolved') ?? payload.consultations[0];
+      if (first) setSelectedId(first.id);
+    }
+  }, [auth.token, selectedId]);
+
+  useEffect(() => {
+    refreshQueue().catch((err) => setError(err instanceof Error ? err.message : 'Unable to load queue'));
+    const timer = window.setInterval(() => {
+      refreshQueue().catch(() => undefined);
+    }, 5000);
+    return () => window.clearInterval(timer);
+  }, [refreshQueue]);
+
+  const selected = useMemo(() => queue?.consultations.find((item) => item.id === selectedId), [queue, selectedId]);
+  const aiByCase = useMemo(() => {
+    const map = new Map<string, AiEvent>();
+    for (const event of queue?.ai_events ?? []) map.set(event.consultation_id, event);
+    return map;
+  }, [queue]);
+  const selectedAi = selected ? aiByCase.get(selected.id) : undefined;
+
+  const refreshMessages = useCallback(async () => {
+    if (!selected) return;
+    const payload = await api.getMessages(selected.id);
+    setMessages(payload.messages);
+  }, [selected]);
+
+  useEffect(() => {
+    refreshMessages().catch(() => setMessages([]));
+  }, [selected?.id, refreshMessages]);
+
+  async function sendReply(event: FormEvent) {
+    event.preventDefault();
+    if (!selected || !reply.trim()) return;
+    await api.postMessage(selected.id, reply, selected.language, auth.token);
+    setReply('');
+    await Promise.all([refreshQueue(), refreshMessages()]);
+  }
+
+  async function patch(payload: Parameters<typeof api.patchConsultation>[2]) {
+    if (!selected) return;
+    await api.patchConsultation(selected.id, auth.token, payload);
+    await refreshQueue();
+  }
+
+  async function logout() {
+    await api.logout(auth.token).catch(() => undefined);
+    setAuth(null);
+  }
+
+  const groups = useMemo(() => {
+    const base: Record<ConsultationStatus, Consultation[]> = {
+      waiting_human: [],
+      assigned: [],
+      active: [],
+      needs_expert_review: [],
+      resolved: [],
+    };
+    for (const item of queue?.consultations ?? []) base[item.status].push(item);
+    return base;
+  }, [queue]);
+
   return (
-    <article className="ticket-card">
-      <div className="ticket-head">
-        <strong>{ticket.queue_number}</strong>
-        <span className={`status ${ticket.status}`}>{statusText[ticket.status]}</span>
+    <main className="admin-layout">
+      <section className="workbench">
+        <div className="workspace-head">
+          <div>
+            <div className="eyebrow"><UserCheck size={16} /> WFH command center</div>
+            <h1>Remote queue dashboard</h1>
+          </div>
+          <div className="admin-actions">
+            <button title="Set online" onClick={() => api.setStatus(auth.token, 'online').then(refreshQueue)}>
+              <Wifi size={17} /> Online
+            </button>
+            <button title="Sign out" onClick={logout}><LogOut size={17} /> Logout</button>
+          </div>
+        </div>
+        {error && <div className="error">{error}</div>}
+        <div className="metrics-row">
+          <Metric label="Waiting" value={queue?.metrics.waiting_human ?? 0} />
+          <Metric label="Assigned" value={queue?.metrics.assigned ?? 0} />
+          <Metric label="Active" value={queue?.metrics.active ?? 0} />
+          <Metric label="Specialist" value={queue?.metrics.needs_expert_review ?? 0} />
+        </div>
+        <div className="queue-columns">
+          {(['waiting_human', 'assigned', 'active', 'needs_expert_review'] as ConsultationStatus[]).map((status) => (
+            <QueueColumn
+              key={status}
+              title={statusText[status]}
+              items={groups[status]}
+              selectedId={selectedId}
+              onSelect={setSelectedId}
+              aiByCase={aiByCase}
+            />
+          ))}
+        </div>
+        {queue?.current_user.role === 'supervisor' && <SupervisorPanel queue={queue} selected={selected} onPatch={patch} />}
+      </section>
+
+      <section className="case-panel">
+        <ConsultationRoom3D consultation={selected} latestMessage={messages[messages.length - 1]} aiEvent={selectedAi} />
+        {selected ? (
+          <div className="case-grid">
+            <section className="case-summary">
+              <div className="case-title-row">
+                <div>
+                  <div className="queue-number compact">{selected.queue_number}</div>
+                  <h2>{selected.customer_name}</h2>
+                </div>
+                <div className={`status-badge ${selected.status}`}>{statusText[selected.status]}</div>
+              </div>
+              <p>{selected.topic}</p>
+              <div className="case-fields">
+                <span>Priority: <strong>{selected.priority}</strong></span>
+                <span>Source: <strong>{selected.source}</strong></span>
+                <span>SLA: <strong className={minutesUntil(selected.first_response_due_at) < 0 ? 'danger-text' : ''}>{minutesUntil(selected.first_response_due_at)}m</strong></span>
+              </div>
+              <div className="doc-list">
+                {selected.document_checklist.map((doc) => (
+                  <span key={doc}>{doc}</span>
+                ))}
+              </div>
+              <div className="button-row">
+                <button onClick={() => patch({ needs_expert_review: true })}><AlertTriangle size={17} /> Specialist review</button>
+                <button onClick={() => patch({ status: 'resolved' })}><CheckCircle2 size={17} /> Resolve</button>
+              </div>
+            </section>
+            <section className="ai-panel">
+              <div className="eyebrow"><Bot size={16} /> AI triage</div>
+              <h3>{selectedAi?.classification ?? 'No AI event yet'}</h3>
+              <p>{selectedAi?.summary}</p>
+              <div className="confidence">
+                <span style={{ width: `${Math.round((selectedAi?.confidence ?? 0) * 100)}%` }} />
+              </div>
+              <blockquote>{selectedAi?.suggested_reply}</blockquote>
+              {selectedAi?.escalation_reason && <div className="warning">{selectedAi.escalation_reason}</div>}
+            </section>
+            <section className="chat-panel">
+              <div className="chat-log">
+                {messages.map((message) => (
+                  <div className={`message ${message.role}`} key={message.id}>
+                    <strong>{message.sender_name}</strong>
+                    <span>{message.content}</span>
+                  </div>
+                ))}
+              </div>
+              <form className="chat-compose" onSubmit={sendReply}>
+                <input value={reply} onChange={(e) => setReply(e.target.value)} placeholder="Reply as remote admin" />
+                <button title="Send reply" type="submit"><Send size={18} /></button>
+              </form>
+            </section>
+          </div>
+        ) : (
+          <div className="empty-state">No consultation selected.</div>
+        )}
+      </section>
+    </main>
+  );
+}
+
+function Metric({ label, value }: { label: string; value: number }) {
+  return (
+    <div className="metric">
+      <strong>{value}</strong>
+      <span>{label}</span>
+    </div>
+  );
+}
+
+function QueueColumn({
+  title,
+  items,
+  selectedId,
+  onSelect,
+  aiByCase,
+}: {
+  title: string;
+  items: Consultation[];
+  selectedId: string;
+  onSelect: (id: string) => void;
+  aiByCase: Map<string, AiEvent>;
+}) {
+  return (
+    <section className="queue-column">
+      <h2>{title}</h2>
+      <div className="ticket-list">
+        {items.length === 0 && <div className="mini-empty">Clear</div>}
+        {items.map((item) => (
+          <button
+            key={item.id}
+            className={`ticket ${selectedId === item.id ? 'selected' : ''}`}
+            onClick={() => onSelect(item.id)}
+          >
+            <span>{item.queue_number}</span>
+            <strong>{item.customer_name}</strong>
+            <small>{aiByCase.get(item.id)?.classification ?? item.topic}</small>
+          </button>
+        ))}
       </div>
-      <h3>{ticket.customer_name}</h3>
-      <p>{ticket.topic}</p>
-      <dl>
-        <div>
-          <dt>Source</dt>
-          <dd>{ticket.source}</dd>
+    </section>
+  );
+}
+
+function SupervisorPanel({
+  queue,
+  selected,
+  onPatch,
+}: {
+  queue: QueuePayload;
+  selected?: Consultation;
+  onPatch: (payload: Parameters<typeof api.patchConsultation>[2]) => void;
+}) {
+  const admins = queue.users.filter((user) => user.role === 'admin');
+  return (
+    <section className="supervisor-panel">
+      <div>
+        <div className="eyebrow"><Gauge size={16} /> Supervisor live view</div>
+        <div className="admin-roster">
+          {admins.map((admin) => (
+            <span key={admin.id} className={admin.status}>
+              {admin.name} - {admin.language.toUpperCase()} - {admin.status}
+            </span>
+          ))}
         </div>
-        <div>
-          <dt>Language</dt>
-          <dd>{ticket.language.toUpperCase()}</dd>
-        </div>
-        <div>
-          <dt>Priority</dt>
-          <dd>{ticket.priority}</dd>
-        </div>
-      </dl>
-    </article>
+      </div>
+      {selected && (
+        <label>
+          Reassign selected case
+          <select
+            value={selected.assigned_admin_id ?? ''}
+            onChange={(event) => onPatch({ assigned_admin_id: event.target.value, status: 'assigned' })}
+          >
+            <option value="" disabled>Choose admin</option>
+            {admins.map((admin) => (
+              <option value={admin.id} key={admin.id}>{admin.name}</option>
+            ))}
+          </select>
+        </label>
+      )}
+    </section>
+  );
+}
+
+function AgentDocs() {
+  const example = `curl -X POST ${API_BASE}/v1/consultations \\
+  -H "Content-Type: application/json" \\
+  -d '{
+    "customer_name": "Agent User",
+    "language": "en",
+    "topic": "Login verification failed",
+    "description": "The user cannot sign in after password reset.",
+    "source": "agent"
+  }'`;
+
+  return (
+    <main className="docs-layout">
+      <section>
+        <div className="eyebrow"><MessageSquareText size={16} /> Agent endpoint</div>
+        <h1>REST/OpenAPI support counter</h1>
+        <p>
+          External AI agents can create a support ticket, add messages, request handoff, and poll status.
+          MCP tools are available over Streamable HTTP at {API_BASE}/mcp/.
+        </p>
+        <pre>{example}</pre>
+      </section>
+      <section className="endpoint-grid">
+        {[
+          ['MCP', '/mcp/', 'Streamable HTTP tool endpoint'],
+          ['POST', '/v1/consultations', 'Create ticket and queue number'],
+          ['GET', '/v1/consultations/{id}', 'Read status and queue position'],
+          ['POST', '/v1/consultations/{id}/messages', 'Append customer or agent message'],
+          ['POST', '/v1/consultations/{id}/handoff', 'Escalate to human queue'],
+          ['GET', '/v1/admin/queue', 'Authenticated admin queue'],
+          ['PATCH', '/v1/admin/consultations/{id}', 'Authenticated status and assignment update'],
+        ].map(([method, path, desc]) => (
+          <div className="endpoint" key={path}>
+            <strong>{method}</strong>
+            <code>{path}</code>
+            <span>{desc}</span>
+          </div>
+        ))}
+      </section>
+    </main>
   );
 }
 
