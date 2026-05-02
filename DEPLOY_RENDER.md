@@ -58,13 +58,25 @@ Check:
 ```text
 /health
 /docs
-/mcp/sse
+/mcp/
 /openapi.json
 /agent-openapi.json
 /.well-known/agent-card.json
 /agent-door.json
 /llms.txt
 /
+```
+
+Use this public MCP endpoint in Claude Connector, ChatGPT Developer Mode, or another remote MCP client:
+
+```text
+https://your-render-or-custom-domain/mcp/
+```
+
+Transport:
+
+```text
+Streamable HTTP
 ```
 
 If you add a custom domain later, update `PUBLIC_BASE_URL` and `SUPPORT_COUNTER_CORS_ORIGINS` to that final HTTPS domain, then redeploy or restart the service.
@@ -84,7 +96,7 @@ Open:
 http://127.0.0.1:5173/queue
 ```
 
-Sign in with the seeded admin email and the password you set in Render. Tickets created through `https://your-render-or-custom-domain/mcp/sse` will appear in this local queue viewer.
+Sign in with the seeded admin email and the password you set in Render. Tickets created through `https://your-render-or-custom-domain/mcp/` will appear in this local queue viewer.
 
 Do not deploy the React web client to Render for this setup. If Render shows `Invalid Host header`, the service is running Vite/Node instead of the Docker FastAPI app. Recreate it as a Blueprint/Docker web service from this repo.
 

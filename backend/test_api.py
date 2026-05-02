@@ -1,7 +1,9 @@
+import asyncio
 import importlib
 import os
 
 from fastapi.testclient import TestClient
+from fastmcp.client import Client
 
 
 def load_app(tmp_path, public_base_url=None):
@@ -105,13 +107,13 @@ def test_public_agent_door_discovery_and_agent_flow(tmp_path):
     root = client.get("/")
     assert root.status_code == 200
     assert root.json()["mode"] == "api-only"
-    assert root.json()["mcp_sse"] == f"{public_url}/mcp/sse"
+    assert root.json()["mcp"] == f"{public_url}/mcp/"
 
     card = client.get("/.well-known/agent-card.json")
     assert card.status_code == 200
     assert card.json()["url"] == public_url
     assert card.json()["authentication"]["required"] is False
-    assert card.json()["extensions"][0]["url"] == f"{public_url}/mcp/sse"
+    assert card.json()["extensions"][0]["url"] == f"{public_url}/mcp/"
 
     alias = client.get("/.well-known/agent.json")
     assert alias.status_code == 200
@@ -119,7 +121,8 @@ def test_public_agent_door_discovery_and_agent_flow(tmp_path):
 
     guide = client.get("/agent-door.json")
     assert guide.status_code == 200
-    assert guide.json()["discovery"]["mcp_sse"] == f"{public_url}/mcp/sse"
+    assert guide.json()["discovery"]["mcp"] == f"{public_url}/mcp/"
+    assert guide.json()["mcp"]["transport"] == "streamable-http"
     assert guide.json()["discovery"]["agent_openapi"] == f"{public_url}/agent-openapi.json"
     assert guide.json()["public_endpoints"][0]["operation_id"] == "createSupportConsultation"
     assert "create_support_consultation" in [tool["name"] for tool in guide.json()["mcp"]["tools"]]
@@ -170,21 +173,31 @@ def test_public_agent_door_discovery_and_agent_flow(tmp_path):
     assert protected.status_code == 401
 
     assert any(getattr(route, "path", "") == "/mcp" for route in server.app.routes)
-    tool_names = {tool.name for tool in server.support_mcp._tool_manager.list_tools()}
-    assert {
-        "create_support_consultation",
-        "get_support_consultation",
-        "list_consultation_messages",
-        "post_consultation_message",
-        "request_human_handoff",
-        "get_agent_door_guide",
-    }.issubset(tool_names)
 
-    mcp_created = server.support_mcp._tool_manager.get_tool("create_support_consultation").fn(
-        customer_name="MCP Agent",
-        topic="MCP ticket creation",
-        description="An MCP client needs a human support queue number.",
-        language="en",
-    )
-    assert mcp_created["consultation"]["source"] == "agent"
-    assert mcp_created["consultation"]["queue_number"].startswith("SUP-")
+    async def run_mcp_flow():
+        async with Client(server.support_mcp) as mcp_client:
+            tool_names = {tool.name for tool in await mcp_client.list_tools()}
+            assert {
+                "create_support_consultation",
+                "get_support_consultation",
+                "list_consultation_messages",
+                "post_consultation_message",
+                "request_human_handoff",
+                "get_agent_door_guide",
+            }.issubset(tool_names)
+
+            mcp_created = await mcp_client.call_tool(
+                "create_support_consultation",
+                {
+                    "customer_name": "MCP Agent",
+                    "topic": "Corporate tax rebate question",
+                    "description": "A company with 1B revenue needs human review for tax rebate eligibility.",
+                    "language": "en",
+                },
+            )
+            assert mcp_created.data["consultation"]["source"] == "agent"
+            assert mcp_created.data["consultation"]["queue_number"].startswith("SUP-")
+            assert mcp_created.data["consultation"]["priority"] == "high"
+            assert "tax" in mcp_created.data["ai_event"]["classification"].lower()
+
+    asyncio.run(run_mcp_flow())

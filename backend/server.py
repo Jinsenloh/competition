@@ -7,6 +7,7 @@ import secrets
 import sqlite3
 import time
 import uuid
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Literal
@@ -15,7 +16,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response, 
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
-from mcp.server.fastmcp import FastMCP
+from fastmcp import FastMCP
 from pydantic import BaseModel, Field
 
 
@@ -352,6 +353,18 @@ def classify_case(topic: str, description: str, language: str) -> dict[str, Any]
         confidence = 0.8
         docs = ["Order or booking ID", "Account email", "Preferred contact time", "Supporting screenshot"]
         escalation = None
+    elif any(k in text for k in ["tax", "rebate", "deduction", "1b", "revenue", "corporate tax", "lhdn", "irs"]):
+        classification = "Tax or compliance enquiry"
+        priority = "high"
+        confidence = 0.7
+        docs = [
+            "Company jurisdiction and tax residency",
+            "Latest audited revenue and profit figures",
+            "Entity type and registration number",
+            "Expense, incentive, and rebate documents",
+            "Preferred tax advisor or finance contact",
+        ]
+        escalation = "Tax and compliance questions require review by a qualified human expert."
     else:
         classification = "General customer enquiry"
         priority = "low"
@@ -669,19 +682,6 @@ if PUBLIC_BASE_URL:
     app_config["servers"] = [{"url": PUBLIC_BASE_URL, "description": "Configured public HTTPS server"}]
 
 
-app = FastAPI(**app_config)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=cors_origins(),
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-if SERVE_FRONTEND and (FRONTEND_DIST / "assets").exists():
-    app.mount("/assets", StaticFiles(directory=FRONTEND_DIST / "assets"), name="assets")
-
-
 support_mcp = FastMCP(
     "Public Agent Customer Support Door",
     instructions=(
@@ -703,7 +703,7 @@ def mcp_create_support_consultation(
     customer_email: str | None = None,
     language: Literal["en", "ms"] = "en",
 ) -> dict[str, Any]:
-    ip_hash = enforce_public_rate_limit_key("mcp-sse-public")
+    ip_hash = enforce_public_rate_limit_key("mcp-public")
     payload = ConsultationCreate(
         customer_name=customer_name,
         customer_email=customer_email,
@@ -741,7 +741,7 @@ def mcp_post_consultation_message(
     role: Literal["customer", "agent"] = "agent",
     language: Literal["en", "ms"] = "en",
 ) -> dict[str, Any]:
-    ip_hash = enforce_public_rate_limit_key("mcp-sse-public")
+    ip_hash = enforce_public_rate_limit_key("mcp-public")
     payload = MessageCreate(content=content, role=role, language=language)
     return post_public_message_record(consultation_id, payload, ip_hash=ip_hash)
 
@@ -754,7 +754,7 @@ def mcp_request_human_handoff(
     consultation_id: str,
     reason: str = "The AI tool needs a human support admin to continue.",
 ) -> dict[str, Any]:
-    ip_hash = enforce_public_rate_limit_key("mcp-sse-public")
+    ip_hash = enforce_public_rate_limit_key("mcp-public")
     return request_handoff_record(consultation_id, reason, ip_hash=ip_hash)
 
 
@@ -766,7 +766,29 @@ def mcp_get_agent_door_guide(base_url: str | None = None) -> dict[str, Any]:
     return agent_door_payload(normalize_base_url(base_url) or PUBLIC_BASE_URL or "http://127.0.0.1:8787")
 
 
-app.mount("/mcp", support_mcp.sse_app(), name="mcp-sse")
+mcp_app = support_mcp.http_app(path="/", stateless_http=True, transport="streamable-http")
+
+
+@asynccontextmanager
+async def app_lifespan(app_instance: FastAPI):
+    init_db()
+    async with mcp_app.lifespan(app_instance):
+        yield
+
+
+app = FastAPI(**app_config, lifespan=app_lifespan)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=cors_origins(),
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+if SERVE_FRONTEND and (FRONTEND_DIST / "assets").exists():
+    app.mount("/assets", StaticFiles(directory=FRONTEND_DIST / "assets"), name="assets")
+
+app.mount("/mcp", mcp_app, name="mcp-streamable-http")
 
 
 def agent_card_payload(base_url: str) -> dict[str, Any]:
@@ -817,7 +839,7 @@ def agent_card_payload(base_url: str) -> dict[str, Any]:
             },
         ],
         "extensions": [
-            {"id": "mcp-sse", "name": "MCP SSE tool server", "url": f"{base_url}/mcp/sse"},
+            {"id": "mcp-streamable-http", "name": "MCP Streamable HTTP tool server", "url": f"{base_url}/mcp/"},
             {"id": "agent-openapi", "name": "Public agent OpenAPI contract", "url": f"{base_url}/agent-openapi.json"},
             {"id": "agent-door", "name": "Agent workflow guide", "url": f"{base_url}/agent-door.json"},
             {"id": "llms", "name": "LLM text guide", "url": f"{base_url}/llms.txt"},
@@ -850,14 +872,13 @@ def agent_door_payload(base_url: str) -> dict[str, Any]:
         "discovery": {
             "agent_card": f"{base_url}/.well-known/agent-card.json",
             "agent_card_alias": f"{base_url}/.well-known/agent.json",
-            "mcp_sse": f"{base_url}/mcp/sse",
+            "mcp": f"{base_url}/mcp/",
             "agent_openapi": f"{base_url}/agent-openapi.json",
             "llms_txt": f"{base_url}/llms.txt",
         },
         "mcp": {
-            "transport": "sse",
-            "url": f"{base_url}/mcp/sse",
-            "message_endpoint": f"{base_url}/mcp/messages/",
+            "transport": "streamable-http",
+            "url": f"{base_url}/mcp/",
             "tools": [
                 {
                     "name": "create_support_consultation",
@@ -884,7 +905,7 @@ def agent_door_payload(base_url: str) -> dict[str, Any]:
                     "description": "Read this machine-readable guide through MCP.",
                 },
             ],
-            "client_config_example": {"mcpServers": {"support-door": {"url": f"{base_url}/mcp/sse"}}},
+            "client_config_example": {"mcpServers": {"support-door": {"url": f"{base_url}/mcp/"}}},
         },
         "workflow": [
             {
@@ -1041,7 +1062,7 @@ def get_llms_txt(request: Request) -> str:
             "Purpose: let AI tools create a support consultation, receive a queue number, post updates, and request human handoff.",
             "",
             "Discovery:",
-            f"- MCP SSE tool server: {base_url}/mcp/sse",
+            f"- MCP Streamable HTTP tool server: {base_url}/mcp/",
             f"- Agent Card: {base_url}/.well-known/agent-card.json",
             f"- Agent Guide JSON: {base_url}/agent-door.json",
             f"- Public Agent OpenAPI: {base_url}/agent-openapi.json",
@@ -1069,7 +1090,7 @@ def get_llms_txt(request: Request) -> str:
             '  -H "Content-Type: application/json" \\',
             '  -d \'{"reason":"The AI tool needs a human support admin to continue."}\'',
             "",
-            "MCP SSE tools:",
+            "MCP Streamable HTTP tools:",
             "- create_support_consultation",
             "- get_support_consultation",
             "- list_consultation_messages",
@@ -1078,7 +1099,7 @@ def get_llms_txt(request: Request) -> str:
             "- get_agent_door_guide",
             "",
             "Example MCP server config:",
-            f'{{"mcpServers":{{"support-door":{{"url":"{base_url}/mcp/sse"}}}}}}',
+            f'{{"mcpServers":{{"support-door":{{"url":"{base_url}/mcp/"}}}}}}',
             "",
             "Public consultation endpoints require no API key for this MVP. Admin endpoints require login.",
         ]
@@ -1120,11 +1141,6 @@ def get_agent_openapi() -> dict[str, Any]:
         ),
     }
     return schema
-
-
-@app.on_event("startup")
-def startup() -> None:
-    init_db()
 
 
 @app.get("/health", tags=["System"], summary="Health check", operation_id="getHealth")
@@ -1418,7 +1434,7 @@ def serve_root(request: Request) -> dict[str, Any] | FileResponse:
         "name": "Public Agent Customer Support Door",
         "mode": "api-only",
         "health": f"{base_url}/health",
-        "mcp_sse": f"{base_url}/mcp/sse",
+        "mcp": f"{base_url}/mcp/",
         "agent_door": f"{base_url}/agent-door.json",
         "llms": f"{base_url}/llms.txt",
         "openapi": f"{base_url}/agent-openapi.json",
