@@ -1,6 +1,6 @@
 # Deploy to Render Free
 
-This deployment uses one Render Free Web Service for the public API/MCP agent door only. The React web client is intended to run locally and connect to the deployed API.
+This deployment uses one Render Free Web Service for the React web app, the public API, and the FastMCP agent door.
 
 ## Free tier warning
 
@@ -17,6 +17,12 @@ Dockerfile
 .dockerignore
 render.yaml
 backend/
+src/
+package.json
+package-lock.json
+index.html
+vite.config.*
+tsconfig*.json
 ```
 
 Do not push `node_modules/`, `.deploy/`, `.pytest-tmp/`, `.verification/`, `dist/`, `*.zip`, or local database files.
@@ -34,7 +40,8 @@ SUPPORT_COUNTER_ADMIN_PASSWORD=choose-a-demo-admin-password
 SUPPORT_COUNTER_SUPERVISOR_PASSWORD=choose-a-demo-supervisor-password
 PUBLIC_BASE_URL=https://your-render-or-custom-domain
 SUPPORT_COUNTER_CORS_ORIGINS=https://your-render-or-custom-domain
-SERVE_FRONTEND=false
+FRONTEND_DIST_DIR=/app/dist
+SERVE_FRONTEND=true
 ```
 
 The login emails are:
@@ -67,6 +74,8 @@ Check:
 /
 ```
 
+The root URL `/` should load the web app. The MCP endpoint remains:
+
 Use this public MCP endpoint in Claude Connector, ChatGPT Developer Mode, or another remote MCP client:
 
 ```text
@@ -81,9 +90,9 @@ Streamable HTTP
 
 If you add a custom domain later, update `PUBLIC_BASE_URL` and `SUPPORT_COUNTER_CORS_ORIGINS` to that final HTTPS domain, then redeploy or restart the service.
 
-## 3.1. Use Local Queue Viewer With Deployed MCP
+## 3.1. Use Local Queue Viewer During Development
 
-The deployed MCP server and your local machine do not share SQLite data. To see tickets created through the deployed MCP in your localhost web page, run the frontend locally while pointing it at the deployed backend:
+The deployed MCP server and your local machine do not share SQLite data. If you still want to run the frontend locally while pointing it at the deployed backend:
 
 ```powershell
 $env:VITE_API_BASE="https://your-render-or-custom-domain"
@@ -96,9 +105,9 @@ Open:
 http://127.0.0.1:5173/queue
 ```
 
-Sign in with the seeded admin email and the password you set in Render. Tickets created through `https://your-render-or-custom-domain/mcp/` will appear in this local queue viewer.
+Sign in with the seeded admin email and the password you set in Render. Tickets created through `https://your-render-or-custom-domain/mcp/` will appear in this queue viewer.
 
-Do not deploy the React web client to Render for this setup. If Render shows `Invalid Host header`, the service is running Vite/Node instead of the Docker FastAPI app. Recreate it as a Blueprint/Docker web service from this repo.
+If Render shows `Invalid Host header`, the service is running Vite/Node instead of the Docker FastAPI app. Recreate it as a Blueprint/Docker web service from this repo.
 
 ## 4. Point your Exabytes domain
 

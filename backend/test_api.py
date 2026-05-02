@@ -6,10 +6,20 @@ from fastapi.testclient import TestClient
 from fastmcp.client import Client
 
 
-def load_app(tmp_path, public_base_url=None):
+def load_app(tmp_path, public_base_url=None, serve_frontend=False):
     os.environ["SUPPORT_COUNTER_DB"] = str(tmp_path / "test.db")
     os.environ["SUPPORT_COUNTER_ADMIN_PASSWORD"] = "admin123"
     os.environ["SUPPORT_COUNTER_SUPERVISOR_PASSWORD"] = "super123"
+    if serve_frontend:
+        frontend_dist = tmp_path / "dist"
+        (frontend_dist / "assets").mkdir(parents=True)
+        (frontend_dist / "index.html").write_text("<!doctype html><div id=\"root\"></div>", encoding="utf-8")
+        (frontend_dist / "assets" / "app.js").write_text("console.log('ok');", encoding="utf-8")
+        os.environ["FRONTEND_DIST_DIR"] = str(frontend_dist)
+        os.environ["SERVE_FRONTEND"] = "true"
+    else:
+        os.environ.pop("FRONTEND_DIST_DIR", None)
+        os.environ.pop("SERVE_FRONTEND", None)
     if public_base_url:
         os.environ["PUBLIC_BASE_URL"] = public_base_url
     else:
@@ -208,3 +218,31 @@ def test_public_agent_door_discovery_and_agent_flow(tmp_path):
             assert "tax" in mcp_created.data["ai_event"]["classification"].lower()
 
     asyncio.run(run_mcp_flow())
+
+
+def test_serves_frontend_without_hiding_mcp_or_api_routes(tmp_path):
+    server, client = load_app(tmp_path, "https://support.example.com", serve_frontend=True)
+
+    root = client.get("/")
+    assert root.status_code == 200
+    assert '<div id="root"></div>' in root.text
+
+    spa_route = client.get("/queue")
+    assert spa_route.status_code == 200
+    assert '<div id="root"></div>' in spa_route.text
+
+    asset = client.get("/assets/app.js")
+    assert asset.status_code == 200
+    assert "console.log('ok');" in asset.text
+
+    health = client.get("/health")
+    assert health.status_code == 200
+    assert health.json()["status"] == "ok"
+
+    guide = client.get("/agent-door.json")
+    assert guide.status_code == 200
+    assert guide.json()["mcp"]["url"] == "https://support.example.com/mcp/"
+
+    mcp_redirect = client.get("/mcp", follow_redirects=False)
+    assert mcp_redirect.status_code == 307
+    assert mcp_redirect.headers["location"] == "/mcp/"

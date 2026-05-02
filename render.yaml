@@ -9,8 +9,10 @@ services:
     envVars:
       - key: SUPPORT_COUNTER_DB
         value: /tmp/agent_support_counter.db
+      - key: FRONTEND_DIST_DIR
+        value: /app/dist
       - key: SERVE_FRONTEND
-        value: "false"
+        value: "true"
       - key: SUPPORT_COUNTER_ADMIN_PASSWORD
         sync: false
       - key: SUPPORT_COUNTER_SUPERVISOR_PASSWORD
