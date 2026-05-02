@@ -102,6 +102,11 @@ def test_public_agent_door_discovery_and_agent_flow(tmp_path):
     public_url = "https://support.example.com"
     server, client = load_app(tmp_path, public_url)
 
+    root = client.get("/")
+    assert root.status_code == 200
+    assert root.json()["mode"] == "api-only"
+    assert root.json()["mcp_sse"] == f"{public_url}/mcp/sse"
+
     card = client.get("/.well-known/agent-card.json")
     assert card.status_code == 200
     assert card.json()["url"] == public_url

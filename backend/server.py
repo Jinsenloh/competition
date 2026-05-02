@@ -22,6 +22,7 @@ from pydantic import BaseModel, Field
 ROOT = Path(__file__).resolve().parent
 DB_PATH = Path(os.getenv("SUPPORT_COUNTER_DB", ROOT / "agent_support_counter.db"))
 FRONTEND_DIST = Path(os.getenv("FRONTEND_DIST_DIR", ROOT.parent / "dist"))
+SERVE_FRONTEND = os.getenv("SERVE_FRONTEND", "false").lower() in {"1", "true", "yes"}
 SESSION_HOURS = 10
 APP_VERSION = "0.2.0"
 PUBLIC_RATE_LIMIT_WINDOW_SECONDS = int(os.getenv("PUBLIC_RATE_LIMIT_WINDOW_SECONDS", "60"))
@@ -677,7 +678,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-if (FRONTEND_DIST / "assets").exists():
+if SERVE_FRONTEND and (FRONTEND_DIST / "assets").exists():
     app.mount("/assets", StaticFiles(directory=FRONTEND_DIST / "assets"), name="assets")
 
 
@@ -1408,9 +1409,21 @@ def frontend_index() -> FileResponse:
     return FileResponse(index_path)
 
 
-@app.get("/", include_in_schema=False)
-def serve_frontend_root() -> FileResponse:
-    return frontend_index()
+@app.get("/", include_in_schema=False, response_model=None)
+def serve_root(request: Request) -> dict[str, Any] | FileResponse:
+    if SERVE_FRONTEND:
+        return frontend_index()
+    base_url = public_base_url(request)
+    return {
+        "name": "Public Agent Customer Support Door",
+        "mode": "api-only",
+        "health": f"{base_url}/health",
+        "mcp_sse": f"{base_url}/mcp/sse",
+        "agent_door": f"{base_url}/agent-door.json",
+        "llms": f"{base_url}/llms.txt",
+        "openapi": f"{base_url}/agent-openapi.json",
+        "local_web_note": "Run the React web locally with VITE_API_BASE set to this deployed URL.",
+    }
 
 
 @app.get("/{full_path:path}", include_in_schema=False)
@@ -1429,6 +1442,9 @@ def serve_frontend_path(full_path: str) -> FileResponse:
     )
     if full_path.startswith(reserved_prefixes):
         raise HTTPException(status_code=404, detail="Not found")
+
+    if not SERVE_FRONTEND:
+        raise HTTPException(status_code=404, detail="API-only deployment")
 
     try:
         dist_root = FRONTEND_DIST.resolve()

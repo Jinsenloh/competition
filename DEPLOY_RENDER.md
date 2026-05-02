@@ -1,6 +1,6 @@
 # Deploy to Render Free
 
-This deployment uses one Render Free Web Service. FastAPI serves both the API and the built React frontend from the same domain.
+This deployment uses one Render Free Web Service for the public API/MCP agent door only. The React web client is intended to run locally and connect to the deployed API.
 
 ## Free tier warning
 
@@ -17,12 +17,6 @@ Dockerfile
 .dockerignore
 render.yaml
 backend/
-src/
-package.json
-package-lock.json
-index.html
-vite.config.*
-tsconfig*.json
 ```
 
 Do not push `node_modules/`, `.deploy/`, `.pytest-tmp/`, `.verification/`, `dist/`, `*.zip`, or local database files.
@@ -40,6 +34,7 @@ SUPPORT_COUNTER_ADMIN_PASSWORD=choose-a-demo-admin-password
 SUPPORT_COUNTER_SUPERVISOR_PASSWORD=choose-a-demo-supervisor-password
 PUBLIC_BASE_URL=https://your-render-or-custom-domain
 SUPPORT_COUNTER_CORS_ORIGINS=https://your-render-or-custom-domain
+SERVE_FRONTEND=false
 ```
 
 The login emails are:
@@ -90,6 +85,8 @@ http://127.0.0.1:5173/queue
 ```
 
 Sign in with the seeded admin email and the password you set in Render. Tickets created through `https://your-render-or-custom-domain/mcp/sse` will appear in this local queue viewer.
+
+Do not deploy the React web client to Render for this setup. If Render shows `Invalid Host header`, the service is running Vite/Node instead of the Docker FastAPI app. Recreate it as a Blueprint/Docker web service from this repo.
 
 ## 4. Point your Exabytes domain
 
