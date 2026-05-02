@@ -23,7 +23,11 @@ from pydantic import BaseModel, Field
 ROOT = Path(__file__).resolve().parent
 DB_PATH = Path(os.getenv("SUPPORT_COUNTER_DB", ROOT / "agent_support_counter.db"))
 FRONTEND_DIST = Path(os.getenv("FRONTEND_DIST_DIR", ROOT.parent / "dist"))
-SERVE_FRONTEND = os.getenv("SERVE_FRONTEND", "false").lower() in {"1", "true", "yes"}
+SERVE_FRONTEND = (FRONTEND_DIST / "index.html").exists() or os.getenv("SERVE_FRONTEND", "false").lower() in {
+    "1",
+    "true",
+    "yes",
+}
 SESSION_HOURS = 10
 APP_VERSION = "0.2.0"
 PUBLIC_RATE_LIMIT_WINDOW_SECONDS = int(os.getenv("PUBLIC_RATE_LIMIT_WINDOW_SECONDS", "60"))

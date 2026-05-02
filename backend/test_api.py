@@ -18,8 +18,8 @@ def load_app(tmp_path, public_base_url=None, serve_frontend=False):
         os.environ["FRONTEND_DIST_DIR"] = str(frontend_dist)
         os.environ["SERVE_FRONTEND"] = "true"
     else:
-        os.environ.pop("FRONTEND_DIST_DIR", None)
-        os.environ.pop("SERVE_FRONTEND", None)
+        os.environ["FRONTEND_DIST_DIR"] = str(tmp_path / "no-dist")
+        os.environ["SERVE_FRONTEND"] = "false"
     if public_base_url:
         os.environ["PUBLIC_BASE_URL"] = public_base_url
     else:
