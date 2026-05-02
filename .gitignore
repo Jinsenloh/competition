@@ -1,1 +1,12 @@
 node_modules
+dist
+.deploy
+.pytest_cache
+.pytest-tmp
+.verification
+__pycache__
+*.pyc
+*.db
+*.zip
+*.tsbuildinfo
+.env
