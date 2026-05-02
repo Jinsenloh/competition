@@ -19,10 +19,48 @@ a {
   color: inherit;
 }
 
+button,
+input {
+  font: inherit;
+}
+
+button {
+  border: 0;
+  cursor: pointer;
+}
+
 .agent-doc {
   width: min(1080px, calc(100% - 32px));
   margin: 0 auto;
   padding: 40px 0 56px;
+}
+
+.top-nav {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 24px;
+}
+
+.top-nav button,
+.login-form button,
+.toolbar-actions button {
+  padding: 10px 13px;
+  border: 1px solid #cbd5e1;
+  background: #ffffff;
+  color: #1f2933;
+  font-weight: 800;
+}
+
+.top-nav button.selected,
+.login-form button {
+  background: #0f766e;
+  color: #ffffff;
+  border-color: #0f766e;
+}
+
+.login-form button:disabled {
+  opacity: 0.65;
+  cursor: wait;
 }
 
 .doc-header,
@@ -125,6 +163,138 @@ pre {
   font-size: 14px;
 }
 
+.login-form {
+  display: grid;
+  max-width: 460px;
+  gap: 14px;
+}
+
+label {
+  display: grid;
+  gap: 6px;
+  color: #334155;
+  font-weight: 800;
+}
+
+input {
+  width: 100%;
+  padding: 11px 12px;
+  border: 1px solid #cbd5e1;
+  background: #ffffff;
+  color: #111827;
+}
+
+.error {
+  max-width: none;
+  padding: 11px 12px;
+  border: 1px solid #fecaca;
+  background: #fef2f2;
+  color: #991b1b;
+}
+
+.queue-toolbar {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  align-items: flex-start;
+}
+
+.queue-toolbar h2 {
+  margin-bottom: 4px;
+}
+
+.toolbar-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.metrics-grid,
+.ticket-grid {
+  display: grid;
+  gap: 12px;
+}
+
+.metrics-grid {
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+}
+
+.metric,
+.ticket-card {
+  border: 1px solid #d8dee8;
+  background: #ffffff;
+  padding: 14px;
+}
+
+.metric strong,
+.metric span {
+  display: block;
+}
+
+.metric strong {
+  font-size: 28px;
+}
+
+.ticket-grid {
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+}
+
+.ticket-head,
+.ticket-card dl,
+.ticket-card dl div {
+  display: flex;
+}
+
+.ticket-head {
+  justify-content: space-between;
+  gap: 10px;
+  align-items: center;
+}
+
+.ticket-card h3 {
+  margin: 12px 0 4px;
+}
+
+.ticket-card dl {
+  gap: 10px;
+  flex-wrap: wrap;
+  margin: 12px 0 0;
+}
+
+.ticket-card dl div {
+  gap: 4px;
+}
+
+.ticket-card dt {
+  color: #64748b;
+  font-weight: 800;
+}
+
+.ticket-card dd {
+  margin: 0;
+}
+
+.status {
+  padding: 4px 8px;
+  background: #e2e8f0;
+  color: #334155;
+  font-size: 12px;
+  font-weight: 900;
+}
+
+.status.waiting_human {
+  background: #fef3c7;
+}
+
+.status.assigned,
+.status.active {
+  background: #d1fae5;
+}
+
+.status.needs_expert_review {
+  background: #fee2e2;
+}
+
 ol,
 ul {
   margin: 0;
@@ -161,6 +331,11 @@ th {
 
   h1 {
     font-size: 28px;
+  }
+
+  .top-nav,
+  .queue-toolbar {
+    flex-direction: column;
   }
 
   table,

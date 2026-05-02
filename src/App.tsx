@@ -1,4 +1,18 @@
-import { API_BASE } from './api';
+import { FormEvent, useCallback, useEffect, useMemo, useState } from 'react';
+import { api, API_BASE } from './api';
+import type { AuthState, Consultation, ConsultationStatus, QueuePayload } from './types';
+
+type View = 'door' | 'queue';
+
+const authKey = 'agent-door-operator-auth';
+
+const statusText: Record<ConsultationStatus, string> = {
+  waiting_human: 'Waiting',
+  assigned: 'Assigned',
+  active: 'Active',
+  needs_expert_review: 'Review',
+  resolved: 'Resolved',
+};
 
 const createConsultationCurl = `curl -X POST ${API_BASE}/v1/consultations \\
   -H "Content-Type: application/json" \\
@@ -82,8 +96,31 @@ const responseShape = `{
 }`;
 
 function App() {
+  const [view, setView] = useState<View>(() => (window.location.pathname === '/queue' ? 'queue' : 'door'));
+
+  function changeView(next: View) {
+    setView(next);
+    window.history.replaceState(null, '', next === 'queue' ? '/queue' : '/');
+  }
+
   return (
     <main className="agent-doc">
+      <nav className="top-nav" aria-label="Views">
+        <button className={view === 'door' ? 'selected' : ''} onClick={() => changeView('door')}>
+          Agent Door
+        </button>
+        <button className={view === 'queue' ? 'selected' : ''} onClick={() => changeView('queue')}>
+          Local Queue Viewer
+        </button>
+      </nav>
+      {view === 'door' ? <AgentDoor /> : <QueueViewer />}
+    </main>
+  );
+}
+
+function AgentDoor() {
+  return (
+    <>
       <header className="doc-header">
         <p className="kicker">Public Agent Door</p>
         <h1>Customer Support Queue API</h1>
@@ -210,7 +247,183 @@ function App() {
           <li>Rate limiting is enabled on public write endpoints.</li>
         </ul>
       </section>
-    </main>
+    </>
+  );
+}
+
+function readStoredAuth(): AuthState | null {
+  const raw = localStorage.getItem(authKey);
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(raw) as AuthState;
+    if (new Date(parsed.expires_at).getTime() < Date.now()) {
+      localStorage.removeItem(authKey);
+      return null;
+    }
+    return parsed;
+  } catch {
+    localStorage.removeItem(authKey);
+    return null;
+  }
+}
+
+function storeAuth(auth: AuthState | null) {
+  if (auth) localStorage.setItem(authKey, JSON.stringify(auth));
+  else localStorage.removeItem(authKey);
+}
+
+function QueueViewer() {
+  const [auth, setAuthState] = useState<AuthState | null>(() => readStoredAuth());
+  const [queue, setQueue] = useState<QueuePayload | null>(null);
+  const [error, setError] = useState('');
+  const [email, setEmail] = useState('admin@counter.local');
+  const [password, setPassword] = useState('');
+  const [busy, setBusy] = useState(false);
+
+  const setAuth = (next: AuthState | null) => {
+    setAuthState(next);
+    storeAuth(next);
+  };
+
+  const refreshQueue = useCallback(async () => {
+    if (!auth) return;
+    const payload = await api.queue(auth.token);
+    setQueue(payload);
+  }, [auth]);
+
+  useEffect(() => {
+    if (!auth) return;
+    refreshQueue().catch((err) => setError(err instanceof Error ? err.message : 'Unable to load queue'));
+    const timer = window.setInterval(() => {
+      refreshQueue().catch(() => undefined);
+    }, 5000);
+    return () => window.clearInterval(timer);
+  }, [auth, refreshQueue]);
+
+  async function login(event: FormEvent) {
+    event.preventDefault();
+    setBusy(true);
+    setError('');
+    try {
+      const next = await api.login(email, password);
+      setAuth(next);
+      await api.setStatus(next.token, 'online').catch(() => undefined);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Unable to sign in');
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function logout() {
+    if (auth) await api.logout(auth.token).catch(() => undefined);
+    setAuth(null);
+    setQueue(null);
+  }
+
+  const visibleTickets = useMemo(() => {
+    return (queue?.consultations ?? []).filter((ticket) => ticket.status !== 'resolved');
+  }, [queue]);
+
+  return (
+    <>
+      <header className="doc-header">
+        <p className="kicker">Local Queue Viewer</p>
+        <h1>Watch Deployed MCP Tickets From Localhost</h1>
+        <p>
+          Run this frontend locally with <code>VITE_API_BASE</code> set to the deployed Render URL.
+          When an external agent calls the deployed MCP server, the ticket is stored in the deployed backend
+          and appears here after login.
+        </p>
+        <p className="note">
+          Current API target: <code>{API_BASE}</code>
+        </p>
+      </header>
+
+      {!auth ? (
+        <section>
+          <h2>Admin Login</h2>
+          <form className="login-form" onSubmit={login}>
+            <label>
+              Email
+              <input value={email} onChange={(event) => setEmail(event.target.value)} />
+            </label>
+            <label>
+              Password
+              <input type="password" value={password} onChange={(event) => setPassword(event.target.value)} />
+            </label>
+            {error && <p className="error">{error}</p>}
+            <button type="submit" disabled={busy}>{busy ? 'Signing in...' : 'Sign in'}</button>
+          </form>
+        </section>
+      ) : (
+        <>
+          <section className="queue-toolbar">
+            <div>
+              <h2>{auth.user.name}</h2>
+              <p>{auth.user.role} connected to <code>{API_BASE}</code></p>
+            </div>
+            <div className="toolbar-actions">
+              <button onClick={() => refreshQueue().catch((err) => setError(err instanceof Error ? err.message : 'Refresh failed'))}>
+                Refresh
+              </button>
+              <button onClick={logout}>Logout</button>
+            </div>
+          </section>
+
+          {error && <p className="error">{error}</p>}
+
+          <section>
+            <h2>Queue Metrics</h2>
+            <div className="metrics-grid">
+              {(['waiting_human', 'assigned', 'active', 'needs_expert_review'] as ConsultationStatus[]).map((status) => (
+                <div className="metric" key={status}>
+                  <strong>{queue?.metrics[status] ?? 0}</strong>
+                  <span>{statusText[status]}</span>
+                </div>
+              ))}
+            </div>
+          </section>
+
+          <section>
+            <h2>Live Tickets</h2>
+            <div className="ticket-grid">
+              {visibleTickets.length === 0 && <p>No active tickets yet.</p>}
+              {visibleTickets.map((ticket) => (
+                <TicketCard ticket={ticket} key={ticket.id} />
+              ))}
+            </div>
+          </section>
+        </>
+      )}
+    </>
+  );
+}
+
+function TicketCard({ ticket }: { ticket: Consultation }) {
+  return (
+    <article className="ticket-card">
+      <div className="ticket-head">
+        <strong>{ticket.queue_number}</strong>
+        <span className={`status ${ticket.status}`}>{statusText[ticket.status]}</span>
+      </div>
+      <h3>{ticket.customer_name}</h3>
+      <p>{ticket.topic}</p>
+      <dl>
+        <div>
+          <dt>Source</dt>
+          <dd>{ticket.source}</dd>
+        </div>
+        <div>
+          <dt>Language</dt>
+          <dd>{ticket.language.toUpperCase()}</dd>
+        </div>
+        <div>
+          <dt>Priority</dt>
+          <dd>{ticket.priority}</dd>
+        </div>
+      </dl>
+    </article>
   );
 }
 

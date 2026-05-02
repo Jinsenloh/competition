@@ -638,14 +638,13 @@ def require_supervisor(user: dict[str, Any] = Depends(current_user)) -> dict[str
 
 
 def cors_origins() -> list[str]:
+    origins = ["http://127.0.0.1:5173", "http://localhost:5173"]
     raw = os.getenv("SUPPORT_COUNTER_CORS_ORIGINS")
     if raw:
-        origins = [origin.strip() for origin in raw.split(",") if origin.strip()]
-    else:
-        origins = ["http://127.0.0.1:5173", "http://localhost:5173"]
+        origins.extend(origin.strip() for origin in raw.split(",") if origin.strip())
     if PUBLIC_BASE_URL and PUBLIC_BASE_URL not in origins:
         origins.append(PUBLIC_BASE_URL)
-    return origins
+    return list(dict.fromkeys(origins))
 
 
 app_config: dict[str, Any] = {

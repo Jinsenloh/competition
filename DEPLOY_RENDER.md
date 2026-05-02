@@ -74,6 +74,23 @@ Check:
 
 If you add a custom domain later, update `PUBLIC_BASE_URL` and `SUPPORT_COUNTER_CORS_ORIGINS` to that final HTTPS domain, then redeploy or restart the service.
 
+## 3.1. Use Local Queue Viewer With Deployed MCP
+
+The deployed MCP server and your local machine do not share SQLite data. To see tickets created through the deployed MCP in your localhost web page, run the frontend locally while pointing it at the deployed backend:
+
+```powershell
+$env:VITE_API_BASE="https://your-render-or-custom-domain"
+npm run dev -- --port 5173
+```
+
+Open:
+
+```text
+http://127.0.0.1:5173/queue
+```
+
+Sign in with the seeded admin email and the password you set in Render. Tickets created through `https://your-render-or-custom-domain/mcp/sse` will appear in this local queue viewer.
+
 ## 4. Point your Exabytes domain
 
 In Render:
