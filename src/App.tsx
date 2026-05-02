@@ -584,13 +584,16 @@ function AgentDocs() {
         <h1>REST/OpenAPI support counter</h1>
         <p>
           External AI agents can create a support ticket, add messages, request handoff, and poll status.
-          MCP tools are available over Streamable HTTP at {API_BASE}/mcp/.
+          MCP tools are available over Streamable HTTP at {API_BASE}/mcp/. Store the consultation ID or queue number;
+          if the agent loses it, use email or name to recover the latest active support session.
         </p>
         <pre>{example}</pre>
       </section>
       <section className="endpoint-grid">
         {[
           ['MCP', '/mcp/', 'Streamable HTTP tool endpoint'],
+          ['TOOL', 'find_support_consultations', 'Recover active session by email, queue number, or name'],
+          ['TOOL', 'continue_support_session', 'Recover latest active session and post the next chat message'],
           ['POST', '/v1/consultations', 'Create ticket and queue number'],
           ['GET', '/v1/consultations/{id}', 'Read status and queue position'],
           ['POST', '/v1/consultations/{id}/messages', 'Append customer or agent message'],

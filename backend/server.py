@@ -557,6 +557,68 @@ def list_messages_payload(consultation_id: str) -> dict[str, Any]:
         return {"messages": rows_dict(messages)}
 
 
+def find_consultations_payload(
+    *,
+    consultation_id: str | None = None,
+    queue_number: str | None = None,
+    customer_email: str | None = None,
+    customer_name: str | None = None,
+    active_only: bool = True,
+    limit: int = 5,
+) -> dict[str, Any]:
+    filters = []
+    params: list[Any] = []
+    if consultation_id:
+        filters.append("id = ?")
+        params.append(consultation_id)
+    if queue_number:
+        filters.append("queue_number = ?")
+        params.append(queue_number)
+    if customer_email:
+        filters.append("lower(customer_email) = lower(?)")
+        params.append(customer_email)
+    if customer_name:
+        filters.append("lower(customer_name) LIKE lower(?)")
+        params.append(f"%{customer_name}%")
+    if active_only:
+        filters.append("status != 'resolved'")
+    if not filters:
+        raise HTTPException(status_code=400, detail="Provide consultation_id, queue_number, customer_email, or customer_name")
+
+    safe_limit = max(1, min(limit, 20))
+    sql = f"""
+        SELECT * FROM consultations
+        WHERE {' AND '.join(filters)}
+        ORDER BY updated_at DESC, created_at DESC
+        LIMIT ?
+    """
+    with connect() as conn:
+        rows = conn.execute(sql, (*params, safe_limit)).fetchall()
+        consultations = rows_dict(rows)
+        return {"consultations": consultations, "count": len(consultations)}
+
+
+def latest_consultation_id(
+    *,
+    consultation_id: str | None = None,
+    queue_number: str | None = None,
+    customer_email: str | None = None,
+    customer_name: str | None = None,
+) -> str:
+    found = find_consultations_payload(
+        consultation_id=consultation_id,
+        queue_number=queue_number,
+        customer_email=customer_email,
+        customer_name=customer_name,
+        active_only=True,
+        limit=1,
+    )
+    consultations = found["consultations"]
+    if not consultations:
+        raise HTTPException(status_code=404, detail="No active consultation found for this session")
+    return consultations[0]["id"]
+
+
 def post_public_message_record(
     consultation_id: str,
     payload: MessageCreate,
@@ -690,8 +752,9 @@ support_mcp = FastMCP(
     "Public Agent Customer Support Door",
     instructions=(
         "Use these tools to create and manage public customer support consultations. "
-        "Create a consultation first, persist the returned consultation.id, show the queue_number to the user, "
-        "then use the id to check status, list messages, post updates, or request human handoff."
+        "Create a consultation first, persist the returned consultation.id and queue_number, show the queue_number "
+        "to the user, then use the id to check status, list messages, post updates, or request human handoff. "
+        "If the agent loses the id, recover the latest active session by email, queue number, or customer name."
     ),
 )
 
@@ -736,6 +799,28 @@ def mcp_list_consultation_messages(consultation_id: str) -> dict[str, Any]:
 
 
 @support_mcp.tool(
+    name="find_support_consultations",
+    description="Recover active support sessions by consultation ID, queue number, customer email, or customer name.",
+)
+def mcp_find_support_consultations(
+    consultation_id: str | None = None,
+    queue_number: str | None = None,
+    customer_email: str | None = None,
+    customer_name: str | None = None,
+    active_only: bool = True,
+    limit: int = 5,
+) -> dict[str, Any]:
+    return find_consultations_payload(
+        consultation_id=consultation_id,
+        queue_number=queue_number,
+        customer_email=customer_email,
+        customer_name=customer_name,
+        active_only=active_only,
+        limit=limit,
+    )
+
+
+@support_mcp.tool(
     name="post_consultation_message",
     description="Post an update from the external agent or customer into an existing consultation.",
 )
@@ -748,6 +833,44 @@ def mcp_post_consultation_message(
     ip_hash = enforce_public_rate_limit_key("mcp-public")
     payload = MessageCreate(content=content, role=role, language=language)
     return post_public_message_record(consultation_id, payload, ip_hash=ip_hash)
+
+
+@support_mcp.tool(
+    name="continue_support_session",
+    description=(
+        "Find the latest active consultation by id, queue number, email, or name, then post a new chat message "
+        "and return the updated consultation with recent messages."
+    ),
+)
+def mcp_continue_support_session(
+    content: str,
+    consultation_id: str | None = None,
+    queue_number: str | None = None,
+    customer_email: str | None = None,
+    customer_name: str | None = None,
+    role: Literal["customer", "agent"] = "agent",
+    language: Literal["en", "ms"] = "en",
+) -> dict[str, Any]:
+    resolved_id = latest_consultation_id(
+        consultation_id=consultation_id,
+        queue_number=queue_number,
+        customer_email=customer_email,
+        customer_name=customer_name,
+    )
+    ip_hash = enforce_public_rate_limit_key("mcp-public")
+    message = post_public_message_record(
+        resolved_id,
+        MessageCreate(content=content, role=role, language=language),
+        ip_hash=ip_hash,
+    )
+    consultation = get_consultation_payload(resolved_id)
+    messages = list_messages_payload(resolved_id)
+    return {
+        "consultation": consultation["consultation"],
+        "ai_event": consultation["ai_event"],
+        "message": message["message"],
+        "messages": messages["messages"],
+    }
 
 
 @support_mcp.tool(
@@ -903,8 +1026,16 @@ def agent_door_payload(base_url: str) -> dict[str, Any]:
                     "description": "List conversation messages for a consultation.",
                 },
                 {
+                    "name": "find_support_consultations",
+                    "description": "Recover active sessions by id, queue number, email, or customer name.",
+                },
+                {
                     "name": "post_consultation_message",
                     "description": "Post a customer or agent update.",
+                },
+                {
+                    "name": "continue_support_session",
+                    "description": "Recover the latest active consultation and post a chat message in one call.",
                 },
                 {
                     "name": "request_human_handoff",
@@ -1008,6 +1139,8 @@ def agent_door_payload(base_url: str) -> dict[str, Any]:
         "agent_instructions": [
             "Use source='agent' when creating a consultation for a user.",
             "Persist consultation.id. It is required for status, messages, and handoff.",
+            "If the conversation restarts, call find_support_consultations using the user's email or queue number.",
+            "Use continue_support_session to post follow-up messages after recovering the active consultation.",
             "Show consultation.queue_number to the user as their support number.",
             "Poll the status endpoint conservatively. Do not spam public write endpoints.",
             "Do not call /v1/admin/* endpoints; they are for authenticated human support admins.",
@@ -1104,9 +1237,16 @@ def get_llms_txt(request: Request) -> str:
             "- create_support_consultation",
             "- get_support_consultation",
             "- list_consultation_messages",
+            "- find_support_consultations",
             "- post_consultation_message",
+            "- continue_support_session",
             "- request_human_handoff",
             "- get_agent_door_guide",
+            "",
+            "Session continuity:",
+            "- Store consultation.id and queue_number in the agent conversation when available.",
+            "- If the agent loses them, call find_support_consultations with customer_email or queue_number.",
+            "- Use continue_support_session to recover the latest active case and append the next user message.",
             "",
             "Example MCP server config:",
             f'{{"mcpServers":{{"support-door":{{"url":"{base_url}/mcp/"}}}}}}',

@@ -143,6 +143,7 @@ def test_public_agent_door_discovery_and_agent_flow(tmp_path):
     assert guide.json()["discovery"]["agent_openapi"] == f"{public_url}/agent-openapi.json"
     assert guide.json()["public_endpoints"][0]["operation_id"] == "createSupportConsultation"
     assert "create_support_consultation" in [tool["name"] for tool in guide.json()["mcp"]["tools"]]
+    assert "continue_support_session" in [tool["name"] for tool in guide.json()["mcp"]["tools"]]
 
     agent_openapi = client.get("/agent-openapi.json")
     assert agent_openapi.status_code == 200
@@ -198,7 +199,9 @@ def test_public_agent_door_discovery_and_agent_flow(tmp_path):
                 "create_support_consultation",
                 "get_support_consultation",
                 "list_consultation_messages",
+                "find_support_consultations",
                 "post_consultation_message",
+                "continue_support_session",
                 "request_human_handoff",
                 "get_agent_door_guide",
             }.issubset(tool_names)
@@ -216,6 +219,28 @@ def test_public_agent_door_discovery_and_agent_flow(tmp_path):
             assert mcp_created.data["consultation"]["queue_number"].startswith("SUP-")
             assert mcp_created.data["consultation"]["priority"] == "high"
             assert "tax" in mcp_created.data["ai_event"]["classification"].lower()
+
+            recovered = await mcp_client.call_tool(
+                "find_support_consultations",
+                {
+                    "customer_name": "MCP Agent",
+                    "limit": 1,
+                },
+            )
+            assert recovered.data["count"] == 1
+            assert recovered.data["consultations"][0]["id"] == mcp_created.data["consultation"]["id"]
+
+            continued = await mcp_client.call_tool(
+                "continue_support_session",
+                {
+                    "customer_name": "MCP Agent",
+                    "content": "Please keep this same chat session active for follow-up tax questions.",
+                    "language": "en",
+                },
+            )
+            assert continued.data["consultation"]["id"] == mcp_created.data["consultation"]["id"]
+            assert continued.data["message"]["role"] == "agent"
+            assert len(continued.data["messages"]) == 2
 
     asyncio.run(run_mcp_flow())
 
