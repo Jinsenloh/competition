@@ -90,6 +90,8 @@ Streamable HTTP
 
 If you add a custom domain later, update `PUBLIC_BASE_URL` and `SUPPORT_COUNTER_CORS_ORIGINS` to that final HTTPS domain, then redeploy or restart the service.
 
+For an existing Render service, open the service in Render and use **Manual Deploy** > **Deploy latest commit** after pushing to GitHub. Also confirm the service is using the `main` branch and Docker runtime, not a Vite/Node static service.
+
 ## 3.1. Use Local Queue Viewer During Development
 
 The deployed MCP server and your local machine do not share SQLite data. If you still want to run the frontend locally while pointing it at the deployed backend:
