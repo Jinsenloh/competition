@@ -14,7 +14,7 @@ from typing import Any, Literal
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, PlainTextResponse
+from fastapi.responses import FileResponse, PlainTextResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastmcp import FastMCP
 from pydantic import BaseModel, Field
@@ -788,6 +788,12 @@ app.add_middleware(
 if SERVE_FRONTEND and (FRONTEND_DIST / "assets").exists():
     app.mount("/assets", StaticFiles(directory=FRONTEND_DIST / "assets"), name="assets")
 
+
+@app.get("/mcp", include_in_schema=False)
+def redirect_mcp() -> RedirectResponse:
+    return RedirectResponse(url="/mcp/", status_code=status.HTTP_307_TEMPORARY_REDIRECT)
+
+
 app.mount("/mcp", mcp_app, name="mcp-streamable-http")
 
 
@@ -1450,6 +1456,7 @@ def serve_frontend_path(full_path: str) -> FileResponse:
         "docs",
         "openapi.json",
         "redoc",
+        "mcp",
         "mcp/",
         ".well-known/",
         "agent-door.json",

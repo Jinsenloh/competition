@@ -109,6 +109,13 @@ def test_public_agent_door_discovery_and_agent_flow(tmp_path):
     assert root.json()["mode"] == "api-only"
     assert root.json()["mcp"] == f"{public_url}/mcp/"
 
+    mcp_redirect = client.get("/mcp", follow_redirects=False)
+    assert mcp_redirect.status_code == 307
+    assert mcp_redirect.headers["location"] == "/mcp/"
+
+    mcp_get = client.get("/mcp/")
+    assert mcp_get.status_code == 405
+
     card = client.get("/.well-known/agent-card.json")
     assert card.status_code == 200
     assert card.json()["url"] == public_url
