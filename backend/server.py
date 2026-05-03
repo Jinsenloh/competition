@@ -754,7 +754,8 @@ support_mcp = FastMCP(
         "Use these tools to create and manage public customer support consultations. "
         "Create a consultation first, persist the returned consultation.id and queue_number, show the queue_number "
         "to the user, then use the id to check status, list messages, post updates, or request human handoff. "
-        "If the agent loses the id, recover the latest active session by email, queue number, or customer name."
+        "If the agent loses the id, recover the latest active session by customer_email first, then queue number, "
+        "then customer name. Only create a new consultation when no active session can be found."
     ),
 )
 
@@ -800,7 +801,10 @@ def mcp_list_consultation_messages(consultation_id: str) -> dict[str, Any]:
 
 @support_mcp.tool(
     name="find_support_consultations",
-    description="Recover active support sessions by consultation ID, queue number, customer email, or customer name.",
+    description=(
+        "Recover active support sessions. Prefer customer_email first; use queue_number, consultation_id, "
+        "or customer_name only when email is unavailable."
+    ),
 )
 def mcp_find_support_consultations(
     consultation_id: str | None = None,
@@ -838,8 +842,8 @@ def mcp_post_consultation_message(
 @support_mcp.tool(
     name="continue_support_session",
     description=(
-        "Find the latest active consultation by id, queue number, email, or name, then post a new chat message "
-        "and return the updated consultation with recent messages."
+        "Continue the same support chat by finding the latest active consultation, preferably by customer_email, "
+        "then posting a new chat message and returning the updated consultation with recent messages."
     ),
 )
 def mcp_continue_support_session(
@@ -1027,7 +1031,7 @@ def agent_door_payload(base_url: str) -> dict[str, Any]:
                 },
                 {
                     "name": "find_support_consultations",
-                    "description": "Recover active sessions by id, queue number, email, or customer name.",
+                    "description": "Recover active sessions, preferably by customer email.",
                 },
                 {
                     "name": "post_consultation_message",
@@ -1035,7 +1039,7 @@ def agent_door_payload(base_url: str) -> dict[str, Any]:
                 },
                 {
                     "name": "continue_support_session",
-                    "description": "Recover the latest active consultation and post a chat message in one call.",
+                    "description": "Recover the latest active session by email and post a chat message in one call.",
                 },
                 {
                     "name": "request_human_handoff",
@@ -1139,7 +1143,8 @@ def agent_door_payload(base_url: str) -> dict[str, Any]:
         "agent_instructions": [
             "Use source='agent' when creating a consultation for a user.",
             "Persist consultation.id. It is required for status, messages, and handoff.",
-            "If the conversation restarts, call find_support_consultations using the user's email or queue number.",
+            "If the conversation restarts, call find_support_consultations using the user's email first.",
+            "If email is unavailable, use queue number, consultation.id, then customer name.",
             "Use continue_support_session to post follow-up messages after recovering the active consultation.",
             "Show consultation.queue_number to the user as their support number.",
             "Poll the status endpoint conservatively. Do not spam public write endpoints.",
@@ -1245,7 +1250,8 @@ def get_llms_txt(request: Request) -> str:
             "",
             "Session continuity:",
             "- Store consultation.id and queue_number in the agent conversation when available.",
-            "- If the agent loses them, call find_support_consultations with customer_email or queue_number.",
+            "- If the agent loses them, call find_support_consultations with customer_email first.",
+            "- If email is unavailable, recover by queue_number, consultation_id, then customer_name.",
             "- Use continue_support_session to recover the latest active case and append the next user message.",
             "",
             "Example MCP server config:",

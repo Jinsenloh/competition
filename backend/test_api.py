@@ -210,6 +210,7 @@ def test_public_agent_door_discovery_and_agent_flow(tmp_path):
                 "create_support_consultation",
                 {
                     "customer_name": "MCP Agent",
+                    "customer_email": "mcp-agent@example.com",
                     "topic": "Corporate tax rebate question",
                     "description": "A company with 1B revenue needs human review for tax rebate eligibility.",
                     "language": "en",
@@ -223,7 +224,7 @@ def test_public_agent_door_discovery_and_agent_flow(tmp_path):
             recovered = await mcp_client.call_tool(
                 "find_support_consultations",
                 {
-                    "customer_name": "MCP Agent",
+                    "customer_email": "mcp-agent@example.com",
                     "limit": 1,
                 },
             )
@@ -233,7 +234,7 @@ def test_public_agent_door_discovery_and_agent_flow(tmp_path):
             continued = await mcp_client.call_tool(
                 "continue_support_session",
                 {
-                    "customer_name": "MCP Agent",
+                    "customer_email": "mcp-agent@example.com",
                     "content": "Please keep this same chat session active for follow-up tax questions.",
                     "language": "en",
                 },
@@ -241,6 +242,30 @@ def test_public_agent_door_discovery_and_agent_flow(tmp_path):
             assert continued.data["consultation"]["id"] == mcp_created.data["consultation"]["id"]
             assert continued.data["message"]["role"] == "agent"
             assert len(continued.data["messages"]) == 2
+
+            handoff = await mcp_client.call_tool(
+                "request_human_handoff",
+                {
+                    "consultation_id": mcp_created.data["consultation"]["id"],
+                    "reason": "Marking this test case resolved from active queue recovery checks.",
+                },
+            )
+            assert handoff.data["consultation"]["status"] == "waiting_human"
+
+            with server.connect() as conn:
+                conn.execute(
+                    "UPDATE consultations SET status = 'resolved', resolved_at = ?, updated_at = ? WHERE id = ?",
+                    (server.now(), server.now(), mcp_created.data["consultation"]["id"]),
+                )
+
+            after_resolve = await mcp_client.call_tool(
+                "find_support_consultations",
+                {
+                    "customer_email": "mcp-agent@example.com",
+                    "limit": 1,
+                },
+            )
+            assert after_resolve.data["count"] == 0
 
     asyncio.run(run_mcp_flow())
 
