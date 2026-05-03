@@ -1,18 +1,45 @@
+import asyncio
+import concurrent.futures
 import importlib
 import os
+import time
 
 from fastapi.testclient import TestClient
+from fastmcp.client import Client
 
 
-def load_app(tmp_path):
+def load_app(tmp_path, public_base_url=None):
     os.environ["SUPPORT_COUNTER_DB"] = str(tmp_path / "test.db")
     os.environ["SUPPORT_COUNTER_ADMIN_PASSWORD"] = "admin123"
     os.environ["SUPPORT_COUNTER_SUPERVISOR_PASSWORD"] = "super123"
+    if public_base_url:
+        os.environ["PUBLIC_BASE_URL"] = public_base_url
+    else:
+        os.environ.pop("PUBLIC_BASE_URL", None)
 
     server = importlib.import_module("backend.server")
     importlib.reload(server)
     server.init_db()
+    server.WAIT_POLL_INTERVAL_SECONDS = 0.05
     return server, TestClient(server.app)
+
+
+def create_agent_consultation(client):
+    created = client.post(
+        "/v1/consultations",
+        json={
+            "customer_name": "Agent User",
+            "customer_email": "agent-user@example.com",
+            "language": "en",
+            "topic": "Login verification failed",
+            "description": "The user cannot sign in after password reset and needs a remote support admin.",
+            "source": "agent",
+        },
+    )
+    assert created.status_code == 201
+    consultation = created.json()["consultation"]
+    messages = client.get(f"/v1/consultations/{consultation['id']}/messages").json()["messages"]
+    return consultation, messages
 
 
 def test_customer_ticket_admin_assignment_and_reply(tmp_path):
@@ -92,3 +119,218 @@ def test_admin_cannot_reassign_without_supervisor_role(tmp_path):
     )
     assert allowed.status_code == 200
     assert allowed.json()["consultation"]["assigned_admin_id"] == "adm-002"
+
+
+def test_wait_for_consultation_update_times_out(tmp_path):
+    server, client = load_app(tmp_path)
+    consultation, messages = create_agent_consultation(client)
+
+    waited = client.get(
+        f"/v1/consultations/{consultation['id']}/wait",
+        params={
+            "after_message_id": messages[-1]["id"],
+            "after_updated_at": consultation["updated_at"],
+            "timeout_seconds": 0,
+        },
+    )
+
+    assert waited.status_code == 200
+    body = waited.json()
+    assert body["timed_out"] is True
+    assert body["has_new_messages"] is False
+    assert body["status_changed"] is False
+    assert body["latest_message_id"] == messages[-1]["id"]
+
+
+def test_wait_for_consultation_update_returns_admin_reply_early(tmp_path):
+    server, client = load_app(tmp_path)
+    consultation, messages = create_agent_consultation(client)
+    token = client.post(
+        "/v1/auth/login",
+        json={"email": "admin@counter.local", "password": "admin123"},
+    ).json()["token"]
+    consultation = client.get(f"/v1/consultations/{consultation['id']}").json()["consultation"]
+    messages = client.get(f"/v1/consultations/{consultation['id']}/messages").json()["messages"]
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(
+            client.get,
+            f"/v1/consultations/{consultation['id']}/wait",
+            params={
+                "after_message_id": messages[-1]["id"],
+                "after_updated_at": consultation["updated_at"],
+                "timeout_seconds": 3,
+            },
+        )
+        time.sleep(0.1)
+        posted = client.post(
+            f"/v1/consultations/{consultation['id']}/messages",
+            headers={"Authorization": f"Bearer {token}"},
+            json={"content": "Admin reply from the queue.", "language": "en"},
+        )
+        assert posted.status_code == 201
+        waited = future.result(timeout=2)
+
+    assert waited.status_code == 200
+    body = waited.json()
+    assert body["timed_out"] is False
+    assert body["has_new_messages"] is True
+    assert body["messages"][-1]["role"] == "admin"
+    assert body["messages"][-1]["content"] == "Admin reply from the queue."
+
+
+def test_wait_for_consultation_update_returns_status_change_early(tmp_path):
+    server, client = load_app(tmp_path)
+    consultation, messages = create_agent_consultation(client)
+    token = client.post(
+        "/v1/auth/login",
+        json={"email": "supervisor@counter.local", "password": "super123"},
+    ).json()["token"]
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(
+            client.get,
+            f"/v1/consultations/{consultation['id']}/wait",
+            params={
+                "after_message_id": messages[-1]["id"],
+                "after_updated_at": consultation["updated_at"],
+                "timeout_seconds": 3,
+            },
+        )
+        time.sleep(0.1)
+        patched = client.patch(
+            f"/v1/admin/consultations/{consultation['id']}",
+            headers={"Authorization": f"Bearer {token}"},
+            json={"status": "needs_expert_review"},
+        )
+        assert patched.status_code == 200
+        waited = future.result(timeout=2)
+
+    assert waited.status_code == 200
+    body = waited.json()
+    assert body["timed_out"] is False
+    assert body["status_changed"] is True
+    assert body["consultation"]["status"] == "needs_expert_review"
+
+
+def test_public_agent_door_discovery_and_agent_flow(tmp_path):
+    public_url = "https://support.example.com"
+    server, client = load_app(tmp_path, public_url)
+
+    root = client.get("/")
+    assert root.status_code == 200
+    assert root.json()["mode"] == "api-only"
+    assert root.json()["mcp"] == f"{public_url}/mcp/"
+
+    card = client.get("/.well-known/agent-card.json")
+    assert card.status_code == 200
+    assert card.json()["url"] == public_url
+    assert card.json()["authentication"]["required"] is False
+    assert card.json()["extensions"][0]["url"] == f"{public_url}/mcp/"
+
+    alias = client.get("/.well-known/agent.json")
+    assert alias.status_code == 200
+    assert alias.json()["documentationUrl"] == f"{public_url}/agent-door"
+
+    guide = client.get("/agent-door.json")
+    assert guide.status_code == 200
+    assert guide.json()["discovery"]["mcp"] == f"{public_url}/mcp/"
+    assert guide.json()["mcp"]["transport"] == "streamable-http"
+    assert guide.json()["discovery"]["agent_openapi"] == f"{public_url}/agent-openapi.json"
+    assert guide.json()["public_endpoints"][0]["operation_id"] == "createSupportConsultation"
+    assert "create_support_consultation" in [tool["name"] for tool in guide.json()["mcp"]["tools"]]
+    assert "wait_for_consultation_update" in [tool["name"] for tool in guide.json()["mcp"]["tools"]]
+    assert any(endpoint["operation_id"] == "waitForConsultationUpdate" for endpoint in guide.json()["public_endpoints"])
+
+    agent_openapi = client.get("/agent-openapi.json")
+    assert agent_openapi.status_code == 200
+    assert "/v1/consultations" in agent_openapi.json()["paths"]
+    assert f"/v1/consultations/{{consultation_id}}/wait" in agent_openapi.json()["paths"]
+    assert "/v1/admin/queue" not in agent_openapi.json()["paths"]
+
+    llms = client.get("/llms.txt")
+    assert llms.status_code == 200
+    assert f"Base URL: {public_url}" in llms.text
+    assert "wait_for_consultation_update" in llms.text
+
+    openapi = client.get("/openapi.json").json()
+    assert openapi["servers"][0]["url"] == public_url
+    assert "Agent Discovery" in {tag["name"] for tag in openapi["tags"]}
+
+    created = client.post(
+        "/v1/consultations",
+        json={
+            "customer_name": "Agent User",
+            "customer_email": "agent-user@example.com",
+            "language": "en",
+            "topic": "Login verification failed",
+            "description": "The user cannot sign in after password reset and needs a remote support admin.",
+            "source": "agent",
+        },
+    )
+    assert created.status_code == 201
+    consultation = created.json()["consultation"]
+    assert consultation["source"] == "agent"
+    assert consultation["queue_number"].startswith("SUP-")
+
+    posted = client.post(
+        f"/v1/consultations/{consultation['id']}/messages",
+        json={"content": "The user confirmed the account email.", "role": "agent", "language": "en"},
+    )
+    assert posted.status_code == 201
+    assert posted.json()["message"]["role"] == "agent"
+
+    handoff = client.post(
+        f"/v1/consultations/{consultation['id']}/handoff",
+        json={"reason": "The AI tool needs a human support admin to continue."},
+    )
+    assert handoff.status_code == 200
+
+    protected = client.get("/v1/admin/queue")
+    assert protected.status_code == 401
+
+    assert any(getattr(route, "path", "") == "/mcp" for route in server.app.routes)
+
+    async def run_mcp_flow():
+        async with Client(server.support_mcp) as mcp_client:
+            tool_names = {tool.name for tool in await mcp_client.list_tools()}
+            assert {
+                "create_support_consultation",
+                "get_support_consultation",
+                "list_consultation_messages",
+                "post_consultation_message",
+                "request_human_handoff",
+                "wait_for_consultation_update",
+                "get_agent_door_guide",
+            }.issubset(tool_names)
+
+            mcp_created = await mcp_client.call_tool(
+                "create_support_consultation",
+                {
+                    "customer_name": "MCP Agent",
+                    "topic": "Corporate tax rebate question",
+                    "description": "A company with 1B revenue needs human review for tax rebate eligibility.",
+                    "language": "en",
+                },
+            )
+            assert mcp_created.data["consultation"]["source"] == "agent"
+            assert mcp_created.data["consultation"]["queue_number"].startswith("SUP-")
+            assert mcp_created.data["consultation"]["priority"] == "high"
+            assert "tax" in mcp_created.data["ai_event"]["classification"].lower()
+
+            initial_messages = await mcp_client.call_tool(
+                "list_consultation_messages",
+                {"consultation_id": mcp_created.data["consultation"]["id"]},
+            )
+            mcp_waited = await mcp_client.call_tool(
+                "wait_for_consultation_update",
+                {
+                    "consultation_id": mcp_created.data["consultation"]["id"],
+                    "after_message_id": initial_messages.data["messages"][-1]["id"],
+                    "after_updated_at": mcp_created.data["consultation"]["updated_at"],
+                    "timeout_seconds": 0,
+                },
+            )
+            assert mcp_waited.data["timed_out"] is True
+
+    asyncio.run(run_mcp_flow())
